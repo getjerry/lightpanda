@@ -5,6 +5,10 @@ const protocol = @import("protocol.zig");
 
 const log = lp.log;
 
+// Storage snapshots and initialization scripts can exceed the stdin reader's
+// 64 KiB buffer. Bound the complete JSON-RPC frame, not an individual read.
+pub const max_request_bytes = 32 * 1024 * 1024;
+
 /// Generic over the server type. The server must expose: `allocator`, a
 /// `transport: Transport` field, and the per-method `handleInitialize`,
 /// `handleToolList`, `handleToolCall` methods. `handleResourceList` /
@@ -14,16 +18,20 @@ const log = lp.log;
 /// also expose `idle`: the router then pumps the browser session between
 /// requests instead of blocking on the read.
 pub fn processRequests(server: anytype, reader: *std.Io.Reader, input: ?std.Io.File) !void {
+    return processRequestsWithLimit(server, reader, input, max_request_bytes);
+}
+
+fn processRequestsWithLimit(server: anytype, reader: *std.Io.Reader, input: ?std.Io.File, limit: usize) !void {
     var arena: std.heap.ArenaAllocator = .init(server.allocator);
     defer arena.deinit();
 
     while (true) {
-        _ = arena.reset(.retain_capacity);
+        _ = arena.reset(.{ .retain_with_limit = 256 * 1024 });
         const aa = arena.allocator();
 
         if (input) |file| idleUntilInput(server, reader, file);
 
-        const buffered_line = reader.takeDelimiter('\n') catch |err| switch (err) {
+        const buffered_line = readMessage(reader, aa, limit) catch |err| switch (err) {
             error.StreamTooLong => {
                 log.debug(.mcp, "Message too long", .{});
                 try server.sendError(.null, .InvalidRequest, "Message too long");
@@ -39,15 +47,25 @@ pub fn processRequests(server: anytype, reader: *std.Io.Reader, input: ?std.Io.F
         const trimmed = std.mem.trim(u8, buffered_line, " \r\t");
         if (trimmed.len > 0) {
             handleMessage(server, aa, trimmed) catch |err| {
-                log.err(.mcp, "Failed to handle message", .{ .err = err, .msg = trimmed });
+                log.err(.mcp, "Failed to handle message", .{ .err = err, .message_bytes = trimmed.len });
             };
         }
     }
 }
 
+fn readMessage(reader: *std.Io.Reader, arena: std.mem.Allocator, limit: usize) !?[]const u8 {
+    var line: std.Io.Writer.Allocating = .init(arena);
+    // One extra byte lets a frame exactly at the limit reach its delimiter.
+    const count = try reader.streamDelimiterLimit(&line.writer, '\n', .limited(limit + 1));
+    if (reader.bufferedLen() != 0) {
+        reader.toss(1); // streamDelimiterLimit leaves the newline buffered.
+    } else if (count == 0) return null;
+    return line.written();
+}
+
 /// Returns once `reader` holds a delimiter or the fd is readable —
-/// `takeDelimiter` may still block on a partial line, but MCP clients write
-/// whole lines. A full buffer also returns so StreamTooLong surfaces.
+/// `readMessage` may still block on a partial line, but MCP clients write
+/// whole lines. A full buffer also returns so readMessage can drain it.
 fn idleUntilInput(server: anytype, reader: *std.Io.Reader, file: std.Io.File) void {
     while (std.mem.indexOfScalar(u8, reader.buffered(), '\n') == null and
         reader.bufferedLen() < reader.buffer.len)
@@ -83,7 +101,7 @@ pub fn handleMessage(server: anytype, arena: std.mem.Allocator, msg: []const u8)
     const req = std.json.parseFromSliceLeaky(protocol.Request, arena, msg, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        log.debug(.mcp, "JSON Parse Error", .{ .err = err, .msg = msg });
+        log.debug(.mcp, "JSON Parse Error", .{ .err = err, .message_bytes = msg.len });
         try server.sendError(.null, .ParseError, "Parse error");
         return;
     };
@@ -170,4 +188,50 @@ test "MCP.router - handleMessage - synchronous unit tests" {
         try handleMessage(server, aa, "invalid json");
         try testing.expectJson("{\"jsonrpc\": \"2.0\", \"id\": null, \"error\": {\"code\": -32700}}", out_alloc.writer.buffered());
     }
+}
+
+test "MCP.router - storage and init scripts span input buffers; oversized frames recover" {
+    const aa = testing.arena_allocator;
+    var out: std.Io.Writer.Allocating = .init(aa);
+    const server = try Server.init(testing.allocator, testing.test_app, &out.writer);
+    defer server.deinit();
+    const payload = try aa.alloc(u8, 96 * 1024);
+    @memset(payload, 'x');
+    const state_request = try std.json.Stringify.valueAlloc(aa, .{ .id = 11, .method = "tools/call", .params = .{
+        .name = "setStorageState",
+        .arguments = .{ .state = .{ .cookies = &.{}, .origins = &.{.{ .origin = "https://state.test", .localStorage = &.{.{ .name = "large", .value = payload }} }} } },
+    } }, .{});
+    const script_request = try std.json.Stringify.valueAlloc(aa, .{ .id = 12, .method = "tools/call", .params = .{
+        .name = "addInitScript",
+        .arguments = .{ .script = try std.fmt.allocPrint(aa, "/*{s}*/", .{payload}) },
+    } }, .{});
+    const input = try std.fmt.allocPrint(aa, "{s}\n{s}\n", .{ state_request, script_request });
+    var fixed: std.Io.Reader = .fixed(input);
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = fixed.limited(.unlimited, &buffer);
+    try processRequests(server, &reader.interface, null);
+    var responses = std.mem.tokenizeScalar(u8, out.written(), '\n');
+    try testing.expectJson(.{ .id = 11, .result = .{ .isError = false } }, responses.next().?);
+    try testing.expectJson(.{ .id = 12, .result = .{ .isError = false } }, responses.next().?);
+    try testing.expect(responses.next() == null);
+    try testing.expectEqual(payload, server.active_session.session.storage_shed._origins.get("https://state.test").?.local.getItem("large").?);
+    try testing.expectEqual(1, server.active_session.session.inject_scripts.len);
+
+    // An oversized line is discarded through its newline; the next frame is
+    // still a valid JSON-RPC request. Use a small limit to exercise the same path.
+    out.clearRetainingCapacity();
+    const ping = "{\"id\":13,\"method\":\"ping\"}";
+    const padding = " " ** 64;
+    const bounded_input = try std.fmt.allocPrint(aa, "{s}{s}\n{s}{s}\n{{\"id\":15,\"method\":\"ping\"}}", .{
+        ping, padding[0 .. 64 - ping.len], ping, padding[0 .. 65 - ping.len],
+    });
+    var oversized: std.Io.Reader = .fixed(bounded_input);
+    var small_buffer: [16]u8 = undefined;
+    var small_reader = oversized.limited(.unlimited, &small_buffer);
+    try processRequestsWithLimit(server, &small_reader.interface, null, 64);
+    responses = std.mem.tokenizeScalar(u8, out.written(), '\n');
+    try testing.expectJson(.{ .id = 13, .result = struct {}{} }, responses.next().?); // Exactly 64 bytes.
+    try testing.expectJson(.{ .id = null, .@"error" = .{ .code = -32600, .message = "Message too long" } }, responses.next().?); // 65 bytes.
+    try testing.expectJson(.{ .id = 15, .result = struct {}{} }, responses.next().?); // EOF without newline.
+    try testing.expect(responses.next() == null);
 }

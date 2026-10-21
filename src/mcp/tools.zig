@@ -7,6 +7,7 @@ const BrowserTool = browser_tools.Tool;
 
 const protocol = @import("protocol.zig");
 const Server = @import("Server.zig");
+const browser_context = @import("browser_context.zig");
 const McpTool = protocol.Tool;
 
 /// Convert browser tool_defs to MCP wire-protocol tools (comptime).
@@ -123,7 +124,7 @@ const extra_tools = [_]McpTool{
     },
 };
 
-const all_tools = browser_tool_list ++ extra_tools;
+const all_tools = browser_tool_list ++ extra_tools ++ browser_context.tools;
 
 /// Tools that bypass the browser-tool dispatch and have their own handlers.
 const ExtraTool = enum {
@@ -146,6 +147,19 @@ pub fn handleCall(server: *Server, arena: std.mem.Allocator, req: protocol.Reque
     const call_params = browser_tools.parseValue(protocol.CallParams, arena, params) catch {
         return server.sendError(id, .InvalidParams, "Invalid params");
     };
+
+    if (std.meta.stringToEnum(browser_context.Tool, call_params.name)) |tool| {
+        const text = browser_context.call(tool, arena, server.active_session, call_params.arguments) catch |err| {
+            return server.sendError(id, switch (err) {
+                error.OutOfMemory => .InternalError,
+                error.Cancelled => .Cancelled,
+                error.Timeout => .Timeout,
+                error.PageNotFound => .NotFound,
+                else => .InvalidParams,
+            }, @errorName(err));
+        };
+        return sendToolResultText(server, id, text, false);
+    }
 
     if (std.meta.stringToEnum(ExtraTool, call_params.name)) |tool| {
         return switch (tool) {
@@ -701,6 +715,107 @@ test "MCP - followed popup supports async evaluate and condition waits" {
     }
 }
 
+test "MCP - storage state and selected pages round-trip without navigation" {
+    const aa = testing.arena_allocator;
+    var out: std.Io.Writer.Allocating = .init(aa);
+    const server = try testLoadPage("http://localhost:9582/src/browser/tests/mcp_target_blank.html", &out.writer);
+    defer server.deinit();
+    try testCallTool(server, &out, "listPages", .{});
+    const parent_id = (try testToolJson(&out)).array.items[0].object.get("id").?.integer;
+    try testCallTool(server, &out, "evaluate", .{ .script = "window.savedStorage = localStorage;" });
+    try testCallTool(server, &out, "setStorageState", .{ .state = .{
+        .cookies = &.{.{ .name = "auth", .value = "secret", .domain = "localhost", .path = "/", .expires = -1, .httpOnly = true, .secure = false, .sameSite = "Lax" }},
+        .origins = &.{
+            .{ .origin = "http://localhost:9582", .localStorage = &.{.{ .name = "seed", .value = "a" }} },
+            .{ .origin = "http://127.0.0.1:9582", .localStorage = &.{.{ .name = "seed", .value = "b" }} },
+            .{ .origin = "https://unused.test", .localStorage = &.{.{ .name = "seed", .value = "unused" }} },
+        },
+    } });
+    try testCallTool(server, &out, "evaluate", .{ .script = "savedStorage.getItem('seed') === 'a' && !document.cookie.includes('secret')" });
+    try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = "true" }} } }, out.written());
+    try testCallTool(server, &out, "addInitScript", .{ .script = "sessionStorage.setItem('host', location.hostname); window.initBeforeBody = !document.querySelector('#inp');" });
+    const script_id = (try testToolJson(&out)).object.get("id").?.integer;
+    try testCallTool(server, &out, "evaluate", .{ .script = "document.querySelector('#nt').href = 'http://127.0.0.1:9582/src/browser/tests/mcp_actions.html';" });
+    try testCallTool(server, &out, "click", .{ .selector = "#nt" });
+    try testCallTool(server, &out, "listPages", .{});
+    const pages = (try testToolJson(&out)).array.items;
+    try testing.expectEqual(2, pages.len);
+    const popup = pages[1].object;
+    const popup_id = popup.get("id").?.integer;
+    try testing.expect(popup.get("active").?.bool);
+    try testing.expectEqual(parent_id, popup.get("openerId").?.integer);
+    try testCallTool(server, &out, "fill", .{ .selector = "#inp", .value = "popup-value" });
+    try testCallTool(server, &out, "evaluate", .{ .script = "localStorage.getItem('seed') === 'b' && sessionStorage.getItem('host') === '127.0.0.1' && initBeforeBody" });
+    try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = "true" }} } }, out.written());
+    try testCallTool(server, &out, "getStorageState", .{});
+    const snapshot = try testToolJson(&out);
+    try testing.expectEqual(3, snapshot.object.get("origins").?.array.items.len);
+    const cookie = snapshot.object.get("cookies").?.array.items[0].object;
+    try testing.expect(cookie.get("httpOnly").?.bool);
+    try testing.expectEqual(-1, cookie.get("expires").?.integer);
+    try testing.expectEqual("localhost", cookie.get("domain").?.string);
+    try testing.expect(!snapshot.object.get("sessionStorages").?.object.contains("unused.test"));
+    try testCallTool(server, &out, "evaluate", .{ .script = "document.querySelector('#inp').value" });
+    try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = "popup-value" }} } }, out.written());
+
+    // Navigating/closing A must leave B alive and retain stable page IDs.
+    try testCallTool(server, &out, "selectPage", .{ .id = parent_id });
+    try testCallTool(server, &out, "goto", .{ .url = "http://localhost:9582/src/browser/tests/mcp_actions.html" });
+    try testCallTool(server, &out, "click", .{ .selector = "#btn" });
+    try testCallTool(server, &out, "listPages", .{});
+    const after = (try testToolJson(&out)).array.items;
+    try testing.expectEqual(2, after.len);
+    try testing.expectEqual(parent_id, after[0].object.get("id").?.integer);
+    try testing.expect(after[0].object.get("active").?.bool); // Do not re-follow an old popup.
+    try testCallTool(server, &out, "closePage", .{ .id = parent_id });
+    try testCallTool(server, &out, "selectPage", .{ .id = popup_id });
+    try testCallTool(server, &out, "evaluate", .{ .script = "document.querySelector('#inp').value" });
+    try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = "popup-value" }} } }, out.written());
+    try testCallTool(server, &out, "removeInitScript", .{ .id = script_id });
+    try testCallTool(server, &out, "evaluate", .{ .script = "sessionStorage.clear();" });
+    try testCallTool(server, &out, "goto", .{ .url = "http://127.0.0.1:9582/src/browser/tests/mcp_actions.html" });
+    try testCallTool(server, &out, "evaluate", .{ .script = "sessionStorage.getItem('host') === null && typeof initBeforeBody === 'undefined'" });
+    try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = "true" }} } }, out.written());
+    try testCallTool(server, &out, "newPage", @as(struct {}, .{}));
+    const blank_id = (try testToolJson(&out)).object.get("id").?.integer;
+    try testing.expect(blank_id != popup_id);
+    try testCallTool(server, &out, "setViewport", .{ .width = 1920, .height = 1600 });
+    try testCallTool(server, &out, "evaluate", .{ .script = "innerWidth === 1920 && innerHeight === 1600" });
+    try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = "true" }} } }, out.written());
+}
+
+test "MCP - invalid storage state leaves authenticated state unchanged" {
+    const aa = testing.arena_allocator;
+    var out: std.Io.Writer.Allocating = .init(aa);
+    const server = try testLoadPage("http://localhost:9582/src/browser/tests/mcp_actions.html", &out.writer);
+    defer server.deinit();
+    try testCallTool(server, &out, "evaluate", .{ .script = "document.cookie = 'valid=1'; localStorage.setItem('valid', '1');" });
+    try testCallTool(server, &out, "getStorageState", .{});
+    const before_state = try testToolJson(&out);
+    try testing.expectEqual("Lax", before_state.object.get("cookies").?.array.items[0].object.get("sameSite").?.string);
+    const before = try std.json.Stringify.valueAlloc(aa, before_state, .{});
+    const invalid = [_][]const u8{
+        "{\"cookies\":[],\"origins\":[{\"origin\":\"not-an-origin\",\"localStorage\":[]}]}",
+        "{\"cookies\":[{\"name\":\"x\",\"value\":\"1\",\"domain\":\"localhost\",\"expires\":-2}],\"origins\":[]}",
+        "{\"cookies\":[],\"origins\":[{\"origin\":\"http://localhost:9582\",\"indexedDB\":[]}]}",
+    };
+    for (invalid) |raw| {
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{});
+        const message = try std.json.Stringify.valueAlloc(aa, .{ .id = 9, .method = "tools/call", .params = .{ .name = "setStorageState", .arguments = .{ .state = parsed } } }, .{});
+        out.clearRetainingCapacity();
+        try router.handleMessage(server, aa, message);
+        try testing.expectJson(.{ .id = 9, .@"error" = .{ .code = -32602 } }, out.written());
+        try testCallTool(server, &out, "getStorageState", .{});
+        try testing.expectEqual(before, try std.json.Stringify.valueAlloc(aa, try testToolJson(&out), .{}));
+    }
+}
+
+fn testToolJson(out: *std.Io.Writer.Allocating) !std.json.Value {
+    const response = try std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, out.written(), .{});
+    const text = response.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string;
+    return std.json.parseFromSliceLeaky(std.json.Value, testing.arena_allocator, text, .{});
+}
+
 fn testCallTool(server: *Server, out: *std.Io.Writer.Allocating, name: []const u8, arguments: anytype) !void {
     out.clearRetainingCapacity();
     const message = try std.json.Stringify.valueAlloc(testing.arena_allocator, .{
@@ -710,6 +825,7 @@ fn testCallTool(server: *Server, out: *std.Io.Writer.Allocating, name: []const u
         .params = .{ .name = name, .arguments = arguments },
     }, .{});
     try router.handleMessage(server, testing.arena_allocator, message);
+    if (std.mem.indexOf(u8, out.written(), "\"error\"") != null) std.debug.print("MCP test tool failed: {s}\n", .{name});
     try testing.expectJson(.{ .id = 1, .result = .{ .isError = false } }, out.written());
 }
 

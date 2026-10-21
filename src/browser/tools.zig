@@ -1932,11 +1932,18 @@ fn formatActionResult(
 const ActionScope = struct {
     frame: ?*lp.Frame,
     popups: usize,
+    frame_sequence: u32,
+    opener_id: ?u32,
 };
 
 fn beginAction(session: *lp.Session) ActionScope {
     const frame = session.currentFrame();
-    return .{ .frame = frame, .popups = if (frame) |f| f.page.popups.items.len else 0 };
+    return .{
+        .frame = frame,
+        .popups = if (frame) |f| f.page.popups.items.len else 0,
+        .frame_sequence = session.browser.frame_id_gen,
+        .opener_id = if (frame) |f| f.page.frame._frame_id else null,
+    };
 }
 
 /// Finish a state-changing action: drain any queued navigation triggered by
@@ -1955,7 +1962,25 @@ fn finalizeAction(arena: std.mem.Allocator, session: *lp.Session, registry: *Nod
     if (before != null and before.? != page) registry.reset();
 
     var note: []const u8 = "";
-    if (page.page.popups.items.len > scope.popups) {
+    if (session.independent_popup_pages) {
+        // MCP uses independent top-level Pages. Follow only a popup created by
+        // this action, not an older tab (or a navigation replacement).
+        var popup_id: ?u32 = null;
+        for (session.pages.items) |candidate| {
+            if (candidate.replaces != null or !candidate.script_opened or candidate.frame.window._closed) continue;
+            if (candidate.opener_frame_id != scope.opener_id) continue;
+            if (candidate.frame._frame_id > scope.frame_sequence) popup_id = candidate.frame._frame_id;
+        }
+        if (popup_id) |id| {
+            session.followPopup(id);
+            registry.reset();
+            var waiter = session.runner(.{});
+            waiter.waitForFrame(id, 10000, .{ .until = .networkidle }) catch |err|
+                return if (err == error.Cancelled) ToolError.Cancelled else ToolError.NavigationFailed;
+            page = try requireFrame(session);
+            note = " Opened a new window; tools now act on it.";
+        }
+    } else if (page.page.popups.items.len > scope.popups) {
         // The action opened a new window (target=_blank or window.open).
         // Follow it, as a user whose click opened a tab would.
         var runner = session.runner(.{});
@@ -2497,11 +2522,22 @@ const PerformGotoOpts = struct {
 };
 
 fn performGoto(session: *lp.Session, registry: *NodeRegistry, url: [:0]const u8, opts: PerformGotoOpts) ToolError!lp.Session.Runner.WaitResult {
-    if (session.primaryPage()) |old_page| {
-        registry.reset();
-        old_page.close();
-    }
-    const page = try openPage(session, url);
+    const page: lp.Session.PageHandle = blk: {
+        if (session.independent_popup_pages) {
+            // An explicitly selected popup/tab is the navigation target. Keep
+            // its id and sibling windows, just as queued page navigation does.
+            if (session.currentFrame()) |current| {
+                const id = current._frame_id;
+                registry.reset();
+                session.initiateRootNavigation(id, url, .{ .reason = .address_bar, .kind = .{ .push = null } }) catch return ToolError.NavigationFailed;
+                break :blk .{ .session = session, .frame_id = id };
+            }
+        } else if (session.primaryPage()) |old_page| {
+            registry.reset();
+            old_page.close();
+        }
+        break :blk try openPage(session, url);
+    };
 
     var runner = session.runner(.{});
     const condition = lp.Session.Runner.WaitCondition{ .frame_id = page.frame_id, .until = opts.wait_until };

@@ -72,7 +72,7 @@ arena_pool: *ArenaPool,
 // both the live page and its in-flight replacement.
 pages: std.ArrayList(*Page) = .empty,
 
-// CDP opts in; native MCP keeps its existing popup and navigation behavior.
+// CDP and MCP opt in; agent scripts retain their existing popup behavior.
 independent_popup_pages: bool = false,
 origins: std.StringHashMapUnmanaged(*lp.js.Origin) = .empty,
 window_states: std.AutoHashMapUnmanaged(u32, *WindowState) = .empty,

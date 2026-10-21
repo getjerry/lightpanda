@@ -89,6 +89,8 @@ pub fn createSession(self: *Self, id: []const u8) !*lp.ToolSession {
 
     try entry.init(self.app);
     errdefer entry.deinit();
+    // Native MCP tools address each top-level window independently.
+    entry.session.independent_popup_pages = true;
 
     // Only the default session is backed by the on-disk cookie file; named
     // sessions start clean so agents stay isolated by default.
