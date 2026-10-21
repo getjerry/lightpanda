@@ -656,6 +656,63 @@ test "MCP - click on a target=_blank link follows the new window" {
     } }, out.written());
 }
 
+test "MCP - followed popup supports async evaluate and condition waits" {
+    for ([_][]const u8{ "localhost", "127.0.0.1" }) |host| {
+        var out: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+        const server = try testLoadPage("http://localhost:9582/src/browser/tests/mcp_target_blank.html", &out.writer);
+        defer server.deinit();
+
+        // Exercise same-origin and cross-origin windows through the public
+        // MCP wire path. The opener has #nt; only the popup has #inp.
+        const setup = try std.fmt.allocPrint(testing.arena_allocator, "document.querySelector('#nt').href = 'http://{s}:9582/src/browser/tests/mcp_actions.html';", .{host});
+        try testCallTool(server, &out, "evaluate", .{ .script = setup });
+        try testCallTool(server, &out, "click", .{ .selector = "#nt" });
+        try testing.expect(std.mem.indexOf(u8, out.written(), "Opened a new window") != null);
+
+        try testCallTool(server, &out, "evaluate", .{
+            .script = "return (async () => { await Promise.resolve(); await new Promise(r => setTimeout(r, 10)); document.querySelector('#inp').value = 'popup'; return location.hostname; })();",
+        });
+        try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = host }} } }, out.written());
+
+        try testCallTool(server, &out, "waitForSelector", .{ .selector = "#inp", .timeout = 1000 });
+        try testCallTool(server, &out, "waitForScript", .{ .script = "document.querySelector('#inp').value === 'popup' && !document.querySelector('#nt')", .timeout = 1000 });
+        try testCallTool(server, &out, "waitForState", .{ .state = "load", .timeout = 1000 });
+
+        // The timer is armed without awaiting it. The wait itself must drive
+        // pending popup tasks and query the popup, not its opener.
+        try testCallTool(server, &out, "evaluate", .{
+            .script = "setTimeout(() => { window.popupReady = true; }, 20); void 0;",
+        });
+        try testCallTool(server, &out, "waitForScript", .{ .script = "window.popupReady === true", .timeout = 1000 });
+        try testCallTool(server, &out, "evaluate", .{
+            .script = "setTimeout(() => { const el = document.createElement('div'); el.id = 'late-popup'; document.body.appendChild(el); }, 20); void 0;",
+        });
+        try testCallTool(server, &out, "waitForSelector", .{ .selector = "#late-popup", .timeout = 1000 });
+
+        // Navigation happens during the wait, preserving the window's ID
+        // but replacing its document and JS context. Re-resolve each tick.
+        try testCallTool(server, &out, "evaluate", .{ .script = "setTimeout(() => { location.href = 'mcp_wait_for_selector.html'; }, 20); void 0;" });
+        try testCallTool(server, &out, "waitForSelector", .{ .selector = "#existing", .timeout = 1000 });
+        try testCallTool(server, &out, "waitForScript", .{ .script = "location.pathname.endsWith('/mcp_wait_for_selector.html') && !document.querySelector('#inp')", .timeout = 1000 });
+        try testCallTool(server, &out, "evaluate", .{ .script = "setTimeout(() => { location.href = 'mcp_actions.html'; }, 20); void 0;" });
+        try testCallTool(server, &out, "waitForScript", .{ .script = "!!document.querySelector('#inp') && !document.querySelector('#existing')", .timeout = 1000 });
+        try testCallTool(server, &out, "evaluate", .{ .script = "return new Promise(resolve => setTimeout(() => resolve(location.hostname), 10));" });
+        try testing.expectJson(.{ .result = .{ .content = &.{.{ .text = host }} } }, out.written());
+    }
+}
+
+fn testCallTool(server: *Server, out: *std.Io.Writer.Allocating, name: []const u8, arguments: anytype) !void {
+    out.clearRetainingCapacity();
+    const message = try std.json.Stringify.valueAlloc(testing.arena_allocator, .{
+        .jsonrpc = "2.0",
+        .id = 1,
+        .method = "tools/call",
+        .params = .{ .name = name, .arguments = arguments },
+    }, .{});
+    try router.handleMessage(server, testing.arena_allocator, message);
+    try testing.expectJson(.{ .id = 1, .result = .{ .isError = false } }, out.written());
+}
+
 test "MCP - submitting a target=_blank form follows the new window" {
     var out: std.Io.Writer.Allocating = .init(testing.arena_allocator);
     const server = try testLoadPage("http://localhost:9582/src/browser/tests/mcp_target_blank.html", &out.writer);

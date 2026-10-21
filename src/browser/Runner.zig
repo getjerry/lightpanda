@@ -193,6 +193,7 @@ const TickResult = union(enum) {
     ok: u32,
 };
 pub fn tickForFrame(self: *Runner, frame_id: u32, timeout_ms: u32, opts: WaitForFrameOpts) !TickResult {
+    if (self.session.isCancelled()) return error.Cancelled;
     const condition = WaitCondition{ .frame_id = frame_id, .until = opts.until };
     var conditions = [_]WaitCondition{condition};
     const result = try self.tick(timeout_ms, &conditions);
@@ -273,12 +274,10 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
             continue;
         }
 
-        const page = session.pendingOrLivePage(condition.frame_id) orelse {
+        const frame = pendingOrLiveFrame(session, condition.frame_id) orelse {
             condition.status = .{ .err = error.FrameNotFound };
             continue;
         };
-
-        const frame = &page.frame;
         switch (frame._parse_state) {
             .err => |err| {
                 frame._parse_state = .{ .raw_done = @errorName(err) };
@@ -365,10 +364,9 @@ pub fn waitForSelector(self: *Runner, frame_id: u32, input: [:0]const u8, timeou
             return error.Cancelled;
         }
 
-        const page = session.pendingOrLivePage(frame_id) orelse {
+        const frame = pendingOrLiveFrame(session, frame_id) orelse {
             return error.FrameNotFound;
         };
-        const frame = &page.frame;
 
         if (try Selector.query(selector, frame.document.asNode(), frame)) |el| {
             return el;
@@ -400,10 +398,9 @@ pub fn waitForScript(self: *Runner, frame_id: u32, src: [:0]const u8, timeout_ms
     // each tick. Compilation is context-independent, so we can do it up front
     // in whatever context the frame currently has.
     var compiled: js.Script.Unbound.Global = blk: {
-        const page = session.pendingOrLivePage(frame_id) orelse {
+        const frame = pendingOrLiveFrame(session, frame_id) orelse {
             return error.FrameNotFound;
         };
-        const frame = &page.frame;
 
         var ls: js.Local.Scope = undefined;
         frame.js.localScope(&ls);
@@ -427,10 +424,9 @@ pub fn waitForScript(self: *Runner, frame_id: u32, src: [:0]const u8, timeout_ms
             return error.Cancelled;
         }
 
-        const page = session.pendingOrLivePage(frame_id) orelse {
+        const frame = pendingOrLiveFrame(session, frame_id) orelse {
             return error.FrameNotFound;
         };
-        const frame = &page.frame;
 
         var ls: js.Local.Scope = undefined;
         frame.js.localScope(&ls);
@@ -465,6 +461,14 @@ pub fn waitForScript(self: *Runner, frame_id: u32, src: [:0]const u8, timeout_ms
             },
         }
     }
+}
+
+// Root navigations may have an in-flight replacement. Popups and iframes
+// instead live within a Page: keep their own DOM and load state as the wait
+// target while the runner advances the session's shared event loop.
+fn pendingOrLiveFrame(session: *Session, frame_id: u32) ?*Frame {
+    if (session.pendingOrLivePage(frame_id)) |page| return &page.frame;
+    return session.findFrameByFrameId(frame_id);
 }
 
 fn firstConditionError(conditions: []const WaitCondition) !void {
@@ -517,6 +521,68 @@ test "Runner: waitForScript" {
 
     var runner = page.session.runner(.{});
     try runner.waitForScript(page.frame_id, "document.querySelector('#sel1')", 10);
+}
+
+test "Runner: popup waits keep the target frame and reject closed windows" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+    const root = page.frame().?;
+    const popup = try root.openPopup(.{ .url = "../mcp_actions.html", .name = "", .opener = root.window });
+    const popup_id = popup._frame_id;
+    var runner = page.session.runner(.{});
+
+    try runner.waitForFrame(popup_id, 2000, .{ .until = .load });
+    _ = try runner.waitForSelector(popup_id, "#inp", 100);
+    try runner.waitForScript(popup_id, "document.querySelector('#inp') && !document.querySelector('#sel1')", 100);
+    try testing.expectError(error.Timeout, runner.waitForSelector(popup_id, "#sel1", 10));
+    try testing.expectError(error.Timeout, runner.waitForScript(popup_id, "document.querySelector('#sel1')", 10));
+
+    {
+        var ls: js.Local.Scope = undefined;
+        popup.js.localScope(&ls);
+        defer ls.deinit();
+        try ls.local.eval("setTimeout(() => window.close(), 10);", null);
+    }
+    try testing.expectError(error.FrameNotFound, runner.waitForScript(popup_id, "false", 1000));
+    try testing.expectError(error.FrameNotFound, runner.tickForFrame(popup_id, 10, .{}));
+    try testing.expectError(error.FrameNotFound, runner.waitForSelector(popup_id, "#sel1", 10));
+    try testing.expectError(error.FrameNotFound, runner.waitForScript(popup_id, "true", 10));
+    // Closing the popup must not change the opener's normal wait behavior.
+    _ = try runner.waitForSelector(page.frame_id, "#sel1", 10);
+}
+
+test "Runner: iframe waits use the child document" {
+    const page = try testing.pageTest("runner/iframe_idle.html", .{});
+    defer page.close();
+    const child = page.frame().?.child_frames.items[1];
+    var runner = page.session.runner(.{});
+    try runner.waitForFrame(child._frame_id, 100, .{ .until = .load });
+    _ = try runner.waitForSelector(child._frame_id, "#sel1", 10);
+    try runner.waitForScript(child._frame_id, "document.querySelector('#sel1') && !document.querySelector('iframe')", 10);
+    try testing.expectError(error.Timeout, runner.waitForSelector(child._frame_id, "iframe", 10));
+}
+
+test "Runner: popup waits honor cancellation" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+    const root = page.frame().?;
+    const popup = try root.openPopup(.{ .url = "about:blank", .name = "", .opener = root.window });
+    var cancelled = true;
+    page.session.cancel_hook = .{
+        .context = &cancelled,
+        .check = struct {
+            fn check(context: *anyopaque) bool {
+                return @as(*bool, @ptrCast(@alignCast(context))).*;
+            }
+        }.check,
+    };
+    defer page.session.cancel_hook = null;
+
+    var runner = page.session.runner(.{});
+    try testing.expectError(error.Cancelled, runner.tickForFrame(popup._frame_id, 1000, .{}));
+    try testing.expectError(error.Cancelled, runner.waitForFrame(popup._frame_id, 1000, .{}));
+    try testing.expectError(error.Cancelled, runner.waitForSelector(popup._frame_id, "#missing", 1000));
+    try testing.expectError(error.Cancelled, runner.waitForScript(popup._frame_id, "false", 1000));
 }
 
 test "Runner: networkidle notifies child frames" {
