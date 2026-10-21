@@ -1,10 +1,6 @@
 name: agent-regression
 
 on:
-  schedule:
-    # Offset from wpt's 02:21 nightly.
-    - cron: "37 3 * * *"
-
   workflow_dispatch:
     inputs:
       model:
