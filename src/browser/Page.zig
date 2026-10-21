@@ -23,6 +23,8 @@ const js = @import("js/js.zig");
 
 const Frame = @import("Frame.zig");
 const Session = @import("Session.zig");
+const History = @import("webapi/History.zig");
+const Navigation = @import("webapi/navigation/Navigation.zig");
 const Factory = @import("Factory.zig");
 const Viewport = @import("Viewport.zig");
 
@@ -54,6 +56,16 @@ const Allocator = std.mem.Allocator;
 const Page = @This();
 
 session: *Session,
+navigation: *Navigation,
+history: *History,
+opener_frame_id: ?u32 = null,
+script_opened: bool = false,
+waiting_for_debugger: bool = false,
+close_requested: bool = false,
+deferred_initial_navigation: ?struct { url: [:0]const u8, opts: Frame.NavigateOpts } = null,
+// A JS realm in another independent Page may retain a Window wrapper backed
+// by this arena. Only these documents need deferred destruction.
+has_external_window_refs: bool = false,
 
 // DOM version used to invalidate cached state of "live" collections. Ideally
 // this would be on the Frame (and that's where it used to be). But getting the
@@ -254,8 +266,11 @@ pub fn init(self: *Page, session: *Session, frame_id: u32) !void {
     const frame_arena = try session.arena_pool.acquire(.large, "Page.frame_arena");
     errdefer frame_arena.release();
 
+    const state = if (session.independent_popup_pages) try session.windowState(frame_id) else null;
     self.* = .{
         .session = session,
+        .navigation = if (state) |v| v.navigation else session.navigation,
+        .history = if (state) |v| &v.history else &session.history,
         .frame = undefined,
         ._frame_arena = frame_arena,
         .frame_arena = frame_arena.allocator(),
@@ -266,6 +281,27 @@ pub fn init(self: *Page, session: *Session, frame_id: u32) !void {
     self.queued_navigation = &self.queued_navigation_1;
 
     try Frame.init(&self.frame, frame_id, self, .{});
+}
+
+// Target auto-attach can pause a newly created page before its first request.
+// Own command/caller-backed strings until Runtime.runIfWaitingForDebugger.
+pub fn deferInitialNavigation(self: *Page, url: [:0]const u8, opts: Frame.NavigateOpts) !void {
+    const arena = self.frame_arena;
+    var owned = opts;
+    if (opts.body) |v| owned.body = try arena.dupe(u8, v);
+    if (opts.header) |v| owned.header = try arena.dupeZ(u8, v);
+    if (opts.referer) |v| owned.referer = try arena.dupe(u8, v);
+    if (opts.initiator_origin) |v| owned.initiator_origin = try arena.dupe(u8, v);
+    if (opts.initiator_url) |v| owned.initiator_url = switch (v) {
+        .url => |u| .{ .url = try arena.dupeZ(u8, u) },
+        .none => .none,
+    };
+    owned.kind = switch (opts.kind) {
+        .push => |v| .{ .push = if (v) |state| try arena.dupe(u8, state) else null },
+        .replace => |v| .{ .replace = if (v) |state| try arena.dupe(u8, state) else null },
+        else => opts.kind,
+    };
+    self.deferred_initial_navigation = .{ .url = try arena.dupeZ(u8, url), .opts = owned };
 }
 
 pub fn logScope(self: *Page) log.PageScope {
@@ -387,14 +423,15 @@ pub fn getOrCreateOrigin(self: *Page, key_: ?[]const u8) !*js.Origin {
         return js.Origin.init(session.browser.app, session.browser.env.isolate, &opaque_origin);
     };
 
-    const gop = try self.origins.getOrPut(session.arena.allocator(), key);
+    const origins = if (session.independent_popup_pages) &session.origins else &self.origins;
+    const gop = try origins.getOrPut(session.arena.allocator(), key);
     if (gop.found_existing) {
         const origin = gop.value_ptr.*;
         origin.rc += 1;
         return origin;
     }
 
-    errdefer _ = self.origins.remove(key);
+    errdefer _ = origins.remove(key);
 
     const origin = try js.Origin.init(session.browser.app, session.browser.env.isolate, key);
     gop.key_ptr.* = origin.key;
@@ -434,7 +471,8 @@ pub fn revokeBlobUrlsFor(self: *Page, creator: u32) void {
 pub fn releaseOrigin(self: *Page, origin: *js.Origin) void {
     const rc = origin.rc;
     if (rc == 1) {
-        _ = self.origins.remove(origin.key);
+        const origins = if (self.session.independent_popup_pages) &self.session.origins else &self.origins;
+        _ = origins.remove(origin.key);
         origin.deinit(self.session.browser.app);
     } else {
         origin.rc = rc - 1;

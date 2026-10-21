@@ -69,6 +69,7 @@ fn getFullAXTree(cmd: *CDP.Command) !void {
         };
     };
 
+    if (cmd.cdp.targetForFrame(frame._frame_id) != bc) return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
     const doc = frame.window._document.asNode();
     const node = try bc.node_registry.register(doc);
 

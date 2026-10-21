@@ -191,7 +191,9 @@ fn buildCdpCookie(allocator: Allocator, param: CdpCookie) !Cookie {
         .value = value,
         .path = path,
         .domain = domain,
-        .expires = param.expires,
+        // CDP exports session cookies with expires=-1. Accept that same
+        // representation on import so an unmodified storageState round-trips.
+        .expires = if (param.expires == -1) null else param.expires,
         .secure = secure,
         .http_only = param.httpOnly,
         .same_site = same_site orelse .lax,
@@ -358,3 +360,22 @@ pub const ResCookie = struct {
     secure: bool = false,
     sameSite: ?[]const u8 = null,
 };
+
+test "cdp.Storage: importing session cookies preserves expiry semantics" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-SESSION" });
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Storage.setCookies",
+        .params = .{ .cookies = &[_]CdpCookie{
+            .{ .name = "session", .value = "value", .url = "https://example.com", .httpOnly = true, .expires = -1 },
+            .{ .name = "expired", .value = "value", .url = "https://example.com", .expires = 1 },
+        } },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Storage.getCookies" });
+    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{
+        .{ .name = "session", .value = "value", .domain = "example.com", .httpOnly = true, .secure = true, .expires = -1, .size = 12 },
+    } }, .{ .id = 2 });
+}

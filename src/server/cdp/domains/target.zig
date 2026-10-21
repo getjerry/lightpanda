@@ -71,22 +71,12 @@ fn getTargets(cmd: *CDP.Command) !void {
         }, .{});
     };
 
-    const target_id = &(bc.target_id orelse {
-        return cmd.sendResult(.{
-            .targetInfos = [_]TargetInfo{},
-        }, .{});
-    });
-
-    return cmd.sendResult(.{
-        .targetInfos = [_]TargetInfo{.{
-            .targetId = target_id,
-            .type = "page",
-            .title = bc.getTitle() orelse "",
-            .url = bc.getURL() orelse "about:blank",
-            .attached = true,
-            .canAccessOpener = false,
-        }},
-    }, .{});
+    _ = bc;
+    var infos: std.ArrayList(TargetInfo) = .empty;
+    for (cmd.cdp.targets.items) |target| {
+        if (target.target_id != null) try infos.append(cmd.arena, info(target));
+    }
+    return cmd.sendResult(.{ .targetInfos = infos.items }, .{});
 }
 
 fn getBrowserContexts(cmd: *CDP.Command) !void {
@@ -146,7 +136,7 @@ fn disposeBrowserContext(cmd: *CDP.Command) !void {
     }
 
     // Disposing a context closes its target; drivers wait on those events.
-    try bc.closeTarget();
+    for (cmd.cdp.targets.items) |target| try target.closeTarget();
     cmd.cdp.disposeBrowserContext();
     try cmd.sendResult(null, .{});
 }
@@ -168,65 +158,18 @@ fn createTarget(cmd: *CDP.Command) !void {
         else => return err,
     };
 
-    if (bc.target_id != null) {
-        return error.TargetAlreadyLoaded;
-    }
     if (params.browserContextId) |param_browser_context_id| {
-        if (std.mem.eql(u8, param_browser_context_id, bc.id) == false) {
-            return error.UnknownBrowserContextId;
-        }
+        if (!std.mem.eql(u8, param_browser_context_id, bc.id)) return error.UnknownBrowserContextId;
     }
-
-    // if target_id is null, we should never have a blank frame
-    lp.assert(!bc.session.hasPage(), "CDP.target.createTarget not null page", .{});
-
-    // if target_id is null, we should never have a session_id
-    lp.assert(bc.session_id == null, "CDP.target.createTarget not null session_id", .{});
 
     const page = try bc.session.createPage();
     const frame = page.frame().?;
-
-    // the target_id == the frame_id of the "root" frame
-    const frame_id = id.toFrameId(page.frame_id);
-    bc.target_id = frame_id;
-    const target_id = &bc.target_id.?;
-    {
-        var ls: js.Local.Scope = undefined;
-        frame.js.localScope(&ls);
-        defer ls.deinit();
-
-        const aux_data = try std.fmt.allocPrint(cmd.arena, "{{\"isDefault\":true,\"type\":\"default\",\"frameId\":\"{s}\"}}", .{target_id});
-        bc.inspector().contextCreated(
-            &ls.local,
-            "",
-            "", // @ZIGDOM
-            // try frame.origin(arena),
-            aux_data,
-            true,
-        );
-    }
-
-    // change CDP state
-    bc.security_origin = "://";
-    bc.secure_context_type = "InsecureScheme";
-
-    // send targetCreated event
-    // TODO: should this only be sent when Target.setDiscoverTargets
-    // has been enabled?
-    try cmd.sendEvent("Target.targetCreated", .{
-        .targetInfo = TargetInfo{
-            .attached = false,
-            .targetId = target_id,
-            .title = "",
-            .browserContextId = bc.id,
-            .url = "about:blank",
-        },
-    }, .{});
-
-    // attach to the target only if auto attach is set.
-    if (cmd.cdp.target_auto_attach) {
-        try doAttachtoTarget(cmd, target_id);
-    }
+    const target = cmd.cdp.targetForFrame(page.frame_id) orelse return error.TargetNotLoaded;
+    if (target.target_id == null) target.target_id = id.toFrameId(page.frame_id);
+    target.security_origin = "://";
+    target.secure_context_type = "InsecureScheme";
+    try announceTarget(target);
+    const target_id = &target.target_id.?;
 
     if (!std.mem.eql(u8, "about:blank", params.url)) {
         const encoded_url = try URL.resolveNavigation(frame.call_arena, params.url, .{});
@@ -247,11 +190,7 @@ fn attachToTarget(cmd: *CDP.Command) !void {
         flatten: bool = true,
     })) orelse return error.InvalidParams;
 
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const target_id = &(bc.target_id orelse return error.TargetNotLoaded);
-    if (std.mem.eql(u8, target_id, params.targetId) == false) {
-        return error.UnknownTargetId;
-    }
+    const bc = try lookupTarget(cmd, params.targetId);
 
     // The first attach becomes the page's primary session, which all
     // Page/Network/... events are emitted to. Later attaches — e.g.
@@ -259,7 +198,7 @@ fn attachToTarget(cmd: *CDP.Command) !void {
     // browser session while the page session is live — get a distinct
     // auxiliary session so they don't collide with the primary one.
     if (bc.session_id == null) {
-        try doAttachtoTarget(cmd, target_id);
+        try attachPrimary(bc, cmd.input.session_id);
         return cmd.sendResult(.{ .sessionId = bc.session_id }, .{});
     }
 
@@ -271,12 +210,7 @@ fn attachToTarget(cmd: *CDP.Command) !void {
 
     try cmd.sendEvent("Target.attachedToTarget", AttachToTarget{
         .sessionId = session.id,
-        .targetInfo = TargetInfo{
-            .targetId = target_id,
-            .title = bc.getTitle() orelse "",
-            .url = bc.getURL() orelse "about:blank",
-            .browserContextId = bc.id,
-        },
+        .targetInfo = info(bc),
     }, .{ .session_id = parent_id });
 
     return cmd.sendResult(.{ .sessionId = session.id }, .{});
@@ -310,11 +244,7 @@ fn closeTarget(cmd: *CDP.Command) !void {
         targetId: []const u8,
     })) orelse return error.InvalidParams;
 
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const target_id = &(bc.target_id orelse return error.TargetNotLoaded);
-    if (std.mem.eql(u8, target_id, params.targetId) == false) {
-        return error.UnknownTargetId;
-    }
+    const bc = try lookupTarget(cmd, params.targetId);
 
     // can't be null if we have a target_id
     lp.assert(bc.session.hasPage(), "CDP.target.closeTarget null frame", .{});
@@ -330,22 +260,13 @@ fn getTargetInfo(cmd: *CDP.Command) !void {
     const params = (try cmd.params(Params)) orelse Params{};
 
     if (params.targetId) |param_target_id| {
-        const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-        const target_id = &(bc.target_id orelse return error.TargetNotLoaded);
-        if (std.mem.eql(u8, target_id, param_target_id) == false) {
-            return error.UnknownTargetId;
+        const bc = try lookupTarget(cmd, param_target_id);
+        return cmd.sendResult(.{ .targetInfo = info(bc) }, .{});
+    }
+    if (cmd.input.session_id) |session_id| {
+        if (cmd.cdp.targetForSession(session_id)) |target| {
+            return cmd.sendResult(.{ .targetInfo = info(target) }, .{});
         }
-
-        return cmd.sendResult(.{
-            .targetInfo = TargetInfo{
-                .targetId = target_id,
-                .type = "page",
-                .title = bc.getTitle() orelse "",
-                .url = bc.getURL() orelse "about:blank",
-                .attached = true,
-                .canAccessOpener = false,
-            },
-        }, .{});
     }
 
     return cmd.sendResult(.{
@@ -397,7 +318,13 @@ fn detachFromTarget(cmd: *CDP.Command) !void {
     };
     const params = (try cmd.params(Params)) orelse Params{};
 
-    if (cmd.browser_context) |bc| {
+    const requested_target = if (params.sessionId) |sid|
+        cmd.cdp.targetForSession(sid)
+    else if (params.targetId) |tid|
+        cmd.cdp.targetForId(tid)
+    else
+        cmd.browser_context;
+    if (requested_target) |bc| {
         // Without a sessionId, detach the primary session (if any).
         if (params.sessionId orelse bc.session_id) |requested_session_id| {
             const session = bc.attached_sessions.get(requested_session_id) orelse return error.UnknownSessionId;
@@ -415,8 +342,14 @@ fn detachFromTarget(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-// TODO: noop method
 fn setDiscoverTargets(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct { discover: bool })) orelse return error.InvalidParams;
+    if (params.discover) {
+        for (cmd.cdp.targets.items) |target| {
+            if (target.target_id == null) continue;
+            try cmd.sendEvent("Target.targetCreated", .{ .targetInfo = info(target) }, .{});
+        }
+    }
     return cmd.sendResult(null, .{});
 }
 
@@ -425,39 +358,31 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
         autoAttach: bool,
         waitForDebuggerOnStart: bool,
         flatten: bool = true,
-        // filter: ?[]TargetFilter = null,
     })) orelse return error.InvalidParams;
 
-    // set a flag to send Target.attachedToTarget events
+    // Page-level auto-attach is for that page's worker targets, not sibling
+    // windows. Browser-level auto-attach owns the page sessions.
+    if (cmd.input.session_id) |sid| {
+        if (cmd.cdp.targetForSession(sid) != null) return cmd.sendResult(null, .{});
+    }
     cmd.cdp.target_auto_attach = params.autoAttach;
-
-    if (cmd.cdp.target_auto_attach == false) {
-        // detach from all currently attached targets.
-        if (cmd.browser_context) |bc| {
-            if (bc.session_id) |session_id| {
-                bc.fetchDisableForSession(session_id);
-                try cmd.sendEvent("Target.detachedFromTarget", .{
-                    .sessionId = session_id,
-                }, .{});
-                _ = bc.detachSession(session_id);
-            }
+    cmd.cdp.target_wait_for_debugger = params.waitForDebuggerOnStart;
+    cmd.cdp.target_auto_attach_session = if (cmd.input.session_id) |sid|
+        cmd.cdp.resolveSessionId(sid) orelse return error.UnknownSessionId
+    else
+        null;
+    for (cmd.cdp.targets.items) |target| {
+        if (target.target_id == null) continue;
+        if (params.autoAttach) {
+            if (target.session_id == null) try attachPrimary(target, cmd.input.session_id);
+        } else if (target.session_id) |sid| {
+            target.fetchDisableForSession(sid);
+            const attached = target.attached_sessions.get(sid).?;
+            try cmd.sendEvent("Target.detachedFromTarget", .{ .sessionId = sid }, .{ .session_id = attached.parent_id });
+            _ = target.detachSession(sid);
         }
-        try cmd.sendResult(null, .{});
-        return;
     }
-
-    // autoAttach is set to true, we must attach to all existing targets.
-    if (cmd.browser_context) |bc| {
-        if (bc.target_id == null) {
-            if (bc.mainFrame()) |frame| {
-                // the target_id == the frame_id of the "root" frame
-                bc.target_id = id.toFrameId(frame._frame_id);
-                try doAttachtoTarget(cmd, &bc.target_id.?);
-            }
-        }
-        try cmd.sendResult(null, .{});
-        return;
-    }
+    if (!params.autoAttach or cmd.browser_context != null) return cmd.sendResult(null, .{});
 
     // This is a hack. Puppeteer, and probably others, expect the Browser to
     // automatically started creating targets. Things like an empty tab, or
@@ -481,26 +406,51 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
     try cmd.sendResult(null, .{});
 }
 
-fn doAttachtoTarget(cmd: *CDP.Command, target_id: []const u8) !void {
-    const bc = cmd.browser_context.?;
-    const parent_id = bc.session_id;
+pub fn announceTarget(target: *CDP.BrowserContext) !void {
+    if (target.announced) return;
+    const frame = target.mainFrame() orelse return error.FrameNotLoaded;
+    if (target.target_id == null) target.target_id = id.toFrameId(frame._frame_id);
+    target.announced = true;
+    const arena = target.arena;
+    const aux_data = try std.fmt.allocPrint(arena, "{{\"isDefault\":true,\"type\":\"default\",\"frameId\":\"{s}\"}}", .{&target.target_id.?});
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    target.inspector().contextCreatedInGroup(target.context_group_id, &ls.local, "", frame.origin orelse "", aux_data, true);
+    try target.cdp.sendEvent("Target.targetCreated", .{ .targetInfo = info(target) }, .{});
+    if (target.cdp.target_auto_attach) try attachPrimary(target, target.cdp.target_auto_attach_session);
+}
 
-    if (bc.session_id == null) {
-        // extra_headers should not be kept on a new frame or tab,
-        // currently we have only 1 frame, we clear it just in case
-        bc.extra_headers.clearRetainingCapacity();
-        _ = try bc.attachPrimarySession(cmd.cdp.session_id_gen.next());
-    }
-
-    try cmd.sendEvent("Target.attachedToTarget", AttachToTarget{
-        .sessionId = bc.session_id.?,
-        .targetInfo = TargetInfo{
-            .targetId = target_id,
-            .title = bc.getTitle() orelse "",
-            .url = bc.getURL() orelse "about:blank",
-            .browserContextId = bc.id,
-        },
+fn attachPrimary(target: *CDP.BrowserContext, parent_id: ?[]const u8) !void {
+    if (target.session_id != null) return;
+    const attached = try target.attachPrimarySession(target.cdp.session_id_gen.next());
+    attached.parent_id = if (parent_id) |sid| try target.arena.dupe(u8, sid) else null;
+    try target.cdp.sendEvent("Target.attachedToTarget", AttachToTarget{
+        .sessionId = attached.id,
+        .targetInfo = info(target),
+        .waitingForDebugger = if (target.mainPage()) |page| page.waiting_for_debugger else false,
     }, .{ .session_id = parent_id });
+}
+
+fn lookupTarget(cmd: *CDP.Command, target_id: []const u8) !*CDP.BrowserContext {
+    if (cmd.browser_context == null) return error.BrowserContextNotLoaded;
+    if (cmd.cdp.targetForId(target_id)) |target| return target;
+    for (cmd.cdp.targets.items) |target| {
+        if (target.target_id != null) return error.UnknownTargetId;
+    }
+    return error.TargetNotLoaded;
+}
+
+fn info(target: *const CDP.BrowserContext) TargetInfo {
+    return .{
+        .targetId = &target.target_id.?,
+        .title = target.getTitle() orelse "",
+        .url = target.getURL() orelse "about:blank",
+        .attached = target.session_id != null,
+        .browserContextId = target.id,
+        .openerId = if (target.opener_id) |*opener| opener else null,
+        .canAccessOpener = if (target.mainFrame()) |frame| frame.window._opener != null else false,
+    };
 }
 
 const AttachToTarget = struct {
@@ -517,6 +467,7 @@ const TargetInfo = struct {
     type: []const u8 = "page",
     canAccessOpener: bool = false,
     browserContextId: ?[]const u8 = null,
+    openerId: ?[]const u8 = null,
 };
 
 const testing = @import("../testing.zig");
@@ -979,7 +930,7 @@ test "cdp.target: getTargetInfo" {
                 .type = "page",
                 .title = "",
                 .url = "about:blank",
-                .attached = true,
+                .attached = false,
                 .canAccessOpener = false,
             },
         }, .{ .id = 11 });
@@ -1127,4 +1078,131 @@ test "cdp.target: setAutoAttach false sends detachedFromTarget" {
     try ctx.expectSentEvent("Target.detachedFromTarget", .{ .sessionId = session_id }, .{});
     try testing.expectEqual(null, bc.session_id);
     try ctx.expectSentResult(null, .{ .id = 12 });
+}
+
+test "cdp.target: sibling targets isolate execution and survive independent close" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
+    try ctx.processMessage(.{ .id = 3, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
+    try testing.expectEqual(2, ctx.cdp().targets.items.len);
+    const first = ctx.cdp().targets.items[0];
+    const second = ctx.cdp().targets.items[1];
+    const first_id = first.target_id.?;
+    const first_session = first.session_id.?;
+    const second_session = second.session_id.?;
+    try testing.expect(first.context_group_id != second.context_group_id);
+    try testing.expect(first.session == second.session);
+
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.evaluate", .sessionId = first_session, .params = .{ .expression = "globalThis.marker = 'first'", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "first" } }, .{ .id = 4, .session_id = first_session });
+    try ctx.processMessage(.{ .id = 5, .method = "Runtime.evaluate", .sessionId = second_session, .params = .{ .expression = "typeof marker", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "undefined" } }, .{ .id = 5, .session_id = second_session });
+    try ctx.processMessage(.{ .id = 6, .method = "Runtime.evaluate", .sessionId = second_session, .params = .{ .expression = "globalThis.marker = 'second'", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "second" } }, .{ .id = 6, .session_id = second_session });
+
+    try ctx.processMessage(.{ .id = 7, .method = "Target.closeTarget", .params = .{ .targetId = first_id } });
+    try ctx.expectSentEvent("Target.targetDestroyed", .{ .targetId = first_id }, .{});
+    try ctx.processMessage(.{ .id = 8, .method = "Runtime.evaluate", .sessionId = second_session, .params = .{ .expression = "marker", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "second" } }, .{ .id = 8, .session_id = second_session });
+    try ctx.processMessage(.{ .id = 9, .method = "Target.getTargets" });
+    try ctx.expectSentResult(.{ .targetInfos = &.{info(second)} }, .{ .id = 9 });
+}
+
+test "cdp.target: native popup has its own target and inspector session" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = false } });
+    try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "http://127.0.0.1:9582/src/browser/tests/mcp_target_blank.html" } });
+    const opener = ctx.cdp().targets.items[0];
+    try testing.waitForPage(opener);
+    const opener_session = opener.session_id.?;
+    try ctx.processMessage(.{ .id = 3, .method = "Runtime.evaluate", .sessionId = opener_session, .params = .{ .expression = "window.open('http://localhost:9582/src/browser/tests/mcp_actions.html'); void 0" } });
+    try testing.expectEqual(2, ctx.cdp().targets.items.len);
+    const popup = ctx.cdp().targets.items[1];
+    try testing.waitForPage(popup);
+    try ctx.expectSentEvent("Target.attachedToTarget", .{
+        .sessionId = popup.session_id.?,
+        .targetInfo = .{ .targetId = popup.target_id.?, .openerId = opener.target_id.?, .browserContextId = opener.id },
+    }, .{});
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.evaluate", .sessionId = popup.session_id.?, .params = .{
+        .expression = "!!document.querySelector('#inp') && !document.querySelector('#nt')",
+        .returnByValue = true,
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "boolean", .value = true } }, .{ .id = 4, .session_id = popup.session_id.? });
+    try ctx.processMessage(.{ .id = 5, .method = "Target.closeTarget", .params = .{ .targetId = opener.target_id.? } });
+    try ctx.processMessage(.{ .id = 6, .method = "Runtime.evaluate", .sessionId = popup.session_id.?, .params = .{
+        .expression = "!!document.querySelector('#inp')",
+        .returnByValue = true,
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "boolean", .value = true } }, .{ .id = 6, .session_id = popup.session_id.? });
+
+    // window.close must return through the active inspector call before the
+    // target's inspector session and channel are destroyed on the next tick.
+    const popup_session = popup.session_id.?;
+    const popup_id = popup.target_id.?;
+    try ctx.processMessage(.{ .id = 7, .method = "Runtime.evaluate", .sessionId = popup_session, .params = .{
+        .expression = "window.close(); 17",
+        .returnByValue = true,
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "number", .value = 17 } }, .{ .id = 7, .session_id = popup_session });
+    _ = try popup.session.processQueuedNavigation();
+    try ctx.expectSentEvent("Target.targetDestroyed", .{ .targetId = popup_id }, .{});
+    try testing.expectEqual(null, popup.session_id);
+    try ctx.processMessage(.{ .id = 8, .method = "Target.createTarget", .params = .{ .url = "about:blank" } });
+    const fresh = ctx.cdp().targets.items[2];
+    try ctx.processMessage(.{ .id = 9, .method = "Runtime.evaluate", .sessionId = fresh.session_id.?, .params = .{
+        .expression = "1 + 1",
+        .returnByValue = true,
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "number", .value = 2 } }, .{ .id = 9, .session_id = fresh.session_id.? });
+}
+
+test "cdp.target: auto-attached page waits for initialization before navigation" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = true } });
+    try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "http://127.0.0.1:9582/src/browser/tests/mcp_actions.html" } });
+    const target = ctx.cdp().targets.items[0];
+    const session_id = target.session_id.?;
+    try testing.expect(target.mainPage().?.waiting_for_debugger);
+    try testing.expectEqual("about:blank", target.getURL() orelse "about:blank");
+    try ctx.expectSentEvent("Target.attachedToTarget", .{ .sessionId = session_id, .waitingForDebugger = true }, .{});
+    try ctx.processMessage(.{ .id = 3, .method = "Page.addScriptToEvaluateOnNewDocument", .sessionId = session_id, .params = .{ .source = "window.initialized = 'before-navigation'" } });
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.runIfWaitingForDebugger", .sessionId = session_id });
+    try testing.waitForPage(target);
+    try ctx.processMessage(.{ .id = 5, .method = "Runtime.evaluate", .sessionId = session_id, .params = .{ .expression = "initialized", .returnByValue = true } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "before-navigation" } }, .{ .id = 5, .session_id = session_id });
+}
+
+test "cdp.target: detaching the last debugger resumes pending navigation" {
+    for ([_]bool{ false, true }) |disable_auto_attach| {
+        var ctx = try testing.context();
+        defer ctx.deinit();
+        try ctx.processMessage(.{ .id = 1, .method = "Target.setAutoAttach", .params = .{ .autoAttach = true, .waitForDebuggerOnStart = true } });
+        try ctx.processMessage(.{ .id = 2, .method = "Target.createTarget", .params = .{ .url = "http://127.0.0.1:9582/src/browser/tests/mcp_actions.html" } });
+        const target = ctx.cdp().targets.items[0];
+        try testing.expect(target.mainPage().?.waiting_for_debugger);
+        const primary = target.session_id.?;
+        // An auxiliary session still controls the suspended page after the
+        // primary session detaches; only the final detach releases it.
+        _ = try target.attachSession("SID-AUX", null);
+        if (disable_auto_attach) {
+            try ctx.processMessage(.{ .id = 3, .method = "Target.setAutoAttach", .params = .{ .autoAttach = false, .waitForDebuggerOnStart = false } });
+        } else {
+            try ctx.processMessage(.{ .id = 3, .method = "Target.detachFromTarget", .params = .{ .sessionId = primary } });
+        }
+        try testing.expect(target.mainPage().?.waiting_for_debugger);
+        try ctx.processMessage(.{ .id = 4, .method = "Target.detachFromTarget", .params = .{ .sessionId = "SID-AUX" } });
+        try testing.expect(!target.mainPage().?.waiting_for_debugger);
+        try testing.waitForPage(target);
+        try testing.expectEqual("http://127.0.0.1:9582/src/browser/tests/mcp_actions.html", target.getURL().?);
+        try ctx.processMessage(.{ .id = 5, .method = "Target.attachToTarget", .params = .{ .targetId = target.target_id.? } });
+        try ctx.processMessage(.{ .id = 6, .method = "Runtime.evaluate", .sessionId = target.session_id.?, .params = .{
+            .expression = "!!document.querySelector('#inp')",
+            .returnByValue = true,
+        } });
+        try ctx.expectSentResult(.{ .result = .{ .type = "boolean", .value = true } }, .{ .id = 6, .session_id = target.session_id.? });
+    }
 }

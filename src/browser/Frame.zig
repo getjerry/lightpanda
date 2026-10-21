@@ -653,6 +653,9 @@ fn isPotentiallyTrustworthy(self: *const Frame) bool {
 }
 
 pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !void {
+    if (self == &self.page.frame and self.page.waiting_for_debugger) {
+        return self.page.deferInitialNavigation(request_url, opts);
+    }
     lp.assert(self._load_state == .waiting, "frame.renavigate", .{});
     const session = self._session;
     self._load_state = .parsing;
@@ -808,8 +811,8 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         });
 
         if (self.parent == null) {
-            session.navigation._current_navigation_kind = opts.kind;
-            try session.navigation.commitNavigation(self);
+            self.navigation()._current_navigation_kind = opts.kind;
+            try self.navigation().commitNavigation(self);
         }
 
         self.documentIsComplete();
@@ -905,7 +908,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     // Record telemetry for navigation
     self.recordNavigateTelemetry(std.ascii.startsWithIgnoreCase(self.url, "https://"));
 
-    session.navigation._current_navigation_kind = opts.kind;
+    self.navigation()._current_navigation_kind = opts.kind;
 
     transfer.submit() catch |err| {
         log.debug(.frame, "navigate request", .{ .url = self.url, .err = err, .type = self._type });
@@ -1020,7 +1023,7 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
         target.window._location = location;
 
         if (target.parent == null) {
-            try session.navigation.updateEntries(target.url, opts.kind, target, true);
+            try target.navigation().updateEntries(target.url, opts.kind, target, true);
         }
 
         // `:target` matches off the fragment, which just changed.
@@ -1828,7 +1831,7 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
     }
 
     //We need to handle different navigation types differently.
-    try self._session.navigation.commitNavigation(self);
+    try self.navigation().commitNavigation(self);
 
     if (self._pending_content_type) |content_type| {
         self.document._content_type = content_type;
@@ -2203,6 +2206,8 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
         break :blk try URL.resolve(self.call_arena, frame_base, opts.url, .{ .encoding = self.charset });
     };
 
+    if (session.independent_popup_pages) return session.createPopupPage(self, resolved_url, opts.name, opts.opener);
+
     const popup = try page.frame_arena.create(Frame);
     errdefer page.frame_arena.destroy(popup);
 
@@ -2239,6 +2244,10 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
     try popup.js.setOrigin(popup.origin);
 
     return popup;
+}
+
+pub fn navigation(self: *const Frame) *@import("webapi/navigation/Navigation.zig") {
+    return self.page.navigation;
 }
 
 pub fn domChanged(self: *Frame) void {

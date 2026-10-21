@@ -606,6 +606,7 @@ fn getFrameOwner(cmd: *CDP.Command) !void {
     const frame = bc.session.findFrameByFrameId(frame_id) orelse {
         return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
     };
+    if (cmd.cdp.targetForFrame(frame_id) != bc) return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
 
     // The element hosting the frame, as in Chrome; the main frame has none.
     // Clients (Stagehand's frameLocator, Playwright's contentFrame) match this

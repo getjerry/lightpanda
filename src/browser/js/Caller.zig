@@ -844,13 +844,18 @@ pub const Function = struct {
         defer hs.deinit();
 
         var cache_state: CacheState = undefined;
+        // A retained Window receiver can forward to a newer root document.
+        // Keep the existing document cache for the default/MCP page model.
+        const use_cache = T != @import("../webapi/Window.zig") or !ctx.page.session.independent_popup_pages;
         if (comptime opts.cache) |cache| {
-            // This API is a bit weird. On
-            if (respondFromCache(cache, ctx, v8_context, info, &cache_state)) {
-                // Value was fetched from the cache and returned already
-                return;
-            } else {
-                // Cache miss: cache_state will have been populated
+            if (use_cache) {
+                // This API is a bit weird. On
+                if (respondFromCache(cache, ctx, v8_context, info, &cache_state)) {
+                    // Value was fetched from the cache and returned already
+                    return;
+                } else {
+                    // Cache miss: cache_state will have been populated
+                }
             }
         }
 
@@ -884,7 +889,7 @@ pub const Function = struct {
         };
 
         if (comptime opts.cache) |cache| {
-            cache_state.save(cache, js_value);
+            if (use_cache) cache_state.save(cache, js_value);
         }
     }
 

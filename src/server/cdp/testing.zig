@@ -213,11 +213,20 @@ pub const TestContext = struct {
                 return;
             }
 
-            if (self.cdp_.browser_context) |*bc| {
-                if (bc.session.hasPage()) {
-                    var runner = bc.session.runner(.{});
-                    _ = try runner.tickForFrame(bc.page_handle.?.frame_id, 1000, .{ .until = .done });
-                }
+            // The context's first target may already be closed while sibling
+            // pages remain alive. Pump any live target without assuming a
+            // context-wide current page.
+            for (self.cdp_.targets.items) |target| {
+                const handle = target.page_handle orelse continue;
+                if (handle.page() == null) continue;
+                var runner = target.session.runner(.{});
+                _ = runner.tickForFrame(handle.frame_id, 1000, .{ .until = .done }) catch |err| blk: {
+                    // A script may close this page during the tick. Keep
+                    // checking actual wire messages, not its removed frame.
+                    if (err == error.FrameNotFound and handle.page() == null) break :blk .done;
+                    return err;
+                };
+                break;
             }
             io.sleep(.fromMilliseconds(5), .awake) catch {};
             try self.read();

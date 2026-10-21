@@ -71,8 +71,8 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .printToPDF => return printToPDF(cmd),
         .getLayoutMetrics => return getLayoutMetrics(cmd),
         .handleJavaScriptDialog => return handleJavaScriptDialog(cmd),
-        // CSP isn't enforced, there is a single page, and no file chooser
-        // ever opens: each of these already holds.
+        // CSP is not enforced, pages have no visible foreground, and no
+        // file chooser opens: each of these already holds.
         .setBypassCSP, .bringToFront, .setInterceptFileChooserDialog => return cmd.sendResult(null, .{}),
     }
 }
@@ -193,6 +193,10 @@ fn addScriptToEvaluateOnNewDocument(cmd: *CDP.Command) !void {
                 break :blk world.contextFor(frame);
             } else frame.js;
             if (js_context) |context| {
+                // Initial about:blank is no longer pristine. The first real
+                // navigation must replace its global instead of running this
+                // script again in the same document.
+                bc.main_world_touched = true;
                 var ls: js.Local.Scope = undefined;
                 context.localScope(&ls);
                 defer ls.deinit();
@@ -266,6 +270,7 @@ fn createIsolatedWorld(cmd: *CDP.Command) !void {
     const frame = bc.session.findFrameByFrameId(frame_id) orelse {
         return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
     };
+    if (cmd.cdp.targetForFrame(frame_id) != bc) return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
 
     const gop = try bc.createIsolatedWorld(params.worldName, params.grantUniveralAccess);
     const world = gop.world;
@@ -315,7 +320,8 @@ fn registerIsolatedWorldContext(arena: Allocator, bc: *CDP.BrowserContext, world
     js_context.localScope(&ls);
     defer ls.deinit();
 
-    bc.inspector().contextCreated(
+    bc.inspector().contextCreatedInGroup(
+        bc.context_group_id,
         &ls.local,
         world.name,
         frame.origin orelse "",
@@ -369,7 +375,7 @@ fn stopLoading(cmd: *CDP.Command) !void {
 
 // Fast path that allows using the initial about:blank Frame as-is. Only safe
 // when the frame is still waiting for a navigate AND no JS has been run in the
-// instance (for about:blank, that's only possible via an Runtime.* call)
+// instance (including Runtime calls and runImmediately preload scripts)
 fn canNavigateInPlace(bc: *const CDP.BrowserContext, frame: *const Frame) bool {
     return frame._load_state == .waiting and !bc.main_world_touched;
 }
@@ -428,7 +434,7 @@ fn getNavigationHistory(cmd: *CDP.Command) !void {
         return error.SessionIdNotLoaded;
     }
 
-    const nav = bc.session.navigation;
+    const nav = (bc.mainFrame() orelse return error.FrameNotLoaded).navigation();
     const entries_in = nav._entries.items;
 
     const entries_out = try cmd.arena.alloc(NavigationEntry, entries_in.len);
@@ -463,7 +469,7 @@ fn navigateToHistoryEntry(cmd: *CDP.Command) !void {
     }
 
     const session = bc.session;
-    const nav = session.navigation;
+    const nav = (bc.mainFrame() orelse return error.FrameNotLoaded).navigation();
 
     var target_index: ?usize = null;
     var target_url: ?[:0]const u8 = null;
@@ -558,7 +564,7 @@ pub fn frameNavigate(bc: *CDP.BrowserContext, event: *const Notification.FrameNa
 pub fn frameRemove(bc: *CDP.BrowserContext) void {
     // Clear all remote object mappings to prevent stale objectIds from being used
     // after the context is destroy
-    bc.inspector().resetContextGroup();
+    bc.inspector().resetContextGroupById(bc.context_group_id);
 
     // The main frame is going to be removed, we need to remove contexts from other worlds first.
     for (bc.isolated_worlds.items) |isolated_world| {
@@ -584,12 +590,12 @@ pub fn frameCreated(bc: *CDP.BrowserContext, frame: *Frame) !void {
     // created BEFORE clearing `replaces` (deliberate ordering — see
     // Session.commitPendingPage), so the replacement still reports as in-flight.
     // The captured_response for the request we just committed was inserted by
-    // onHttpResponseHeadersDone moments ago and lives in cdp.frame_arena;
+    // onHttpResponseHeadersDone moments ago and lives in the target's frame arena;
     // resetting either would lose it.
     const in_commit = bc.inCommit();
 
     if (!in_commit) {
-        _ = bc.cdp.frame_arena.reset(.{ .retain_with_limit = 1024 * 512 });
+        _ = bc.owned_frame_arena.reset(.{ .retain_with_limit = 1024 * 512 });
         bc.main_world_touched = false;
     }
 
@@ -743,7 +749,8 @@ pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
         frame.js.localScope(&ls);
         defer ls.deinit();
 
-        bc.inspector().contextCreated(
+        bc.inspector().contextCreatedInGroup(
+            bc.context_group_id,
             &ls.local,
             "",
             frame.origin orelse "",
@@ -1780,18 +1787,13 @@ test "cdp.frame: frameAttached" {
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    const bc = try ctx.loadBrowserContext(.{ .session_id = "SID-X" });
-
-    bc.notification.dispatch(.frame_child_frame_created, &.{
-        .frame_id = 2,
-        .parent_id = 1,
-        .loader_id = 7,
-        .timestamp = 0,
-    });
+    const bc = try ctx.loadBrowserContext(.{ .url = "cdp/empty_iframe.html", .session_id = "SID-X" });
+    const root = bc.mainFrame() orelse unreachable;
+    const child = root.child_frames.items[0];
 
     try ctx.expectSentEvent("Page.frameAttached", .{
-        .frameId = "FID-0000000002",
-        .parentFrameId = "FID-0000000001",
+        .frameId = &id.toFrameId(child._frame_id),
+        .parentFrameId = &id.toFrameId(root._frame_id),
     }, .{ .session_id = "SID-X" });
 }
 

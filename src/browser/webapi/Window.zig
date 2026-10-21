@@ -127,6 +127,25 @@ _closed: bool = false,
 // Popup name (owned by page.arena)
 _name: []const u8 = "",
 
+// Root ids identify browsing contexts across document replacement. A retained
+// cross-page wrapper forwards to the current document, but never another
+// Session or a newly-created browsing context after this one has closed.
+pub fn current(self: *const Window) *Window {
+    const frame = self._frame;
+    if (frame._session.independent_popup_pages and frame.page.destroying and frame == &frame.page.frame) {
+        if (frame._session.livePage(frame._frame_id)) |page| return page.frame.window;
+    }
+    return @constCast(self);
+}
+
+fn accessibleCurrent(self: *const Window, frame: *Frame) !*Window {
+    const target = self.current();
+    if (frame._session.independent_popup_pages and frame.page != target._frame.page) {
+        if (frame.js.origin != target._frame.js.origin) return error.SecurityError;
+    }
+    return target;
+}
+
 pub fn asEventTarget(self: *Window) *EventTarget {
     return self._proto;
 }
@@ -144,7 +163,9 @@ fn getWindow(self: *Window) *Window {
 }
 
 fn getOpener(self: *Window, frame: *Frame) ?Access {
-    const opener = self._opener orelse return null;
+    const target = self.current();
+    if (target._closed) return null;
+    const opener = target._opener orelse return null;
     if (opener._closed) return null;
     return Access.init(frame.window, opener);
 }
@@ -154,27 +175,28 @@ fn getOpener(self: *Window, frame: *Frame) ?Access {
 // the property as an own data property, like [Replaceable].
 fn setOpener(self: *Window, value: js.Value) void {
     if (value.isNull()) {
-        self._opener = null;
+        self.current()._opener = null;
         return;
     }
     self.replaceGlobalProperty(value, "opener");
 }
 
 fn getClosed(self: *const Window) bool {
-    return self._closed;
+    return self.current()._closed;
 }
 
 pub fn getName(self: *const Window) []const u8 {
-    return self._name;
+    return self.current()._name;
 }
 
 pub fn setName(self: *Window, name: []const u8, frame: *Frame) !void {
     // Store in the Page's frame arena so the slice outlives any call_arena.
-    self._name = try frame.arena.dupe(u8, name);
+    const target = self.current();
+    target._name = try (if (frame._session.independent_popup_pages) target._frame.arena else frame.arena).dupe(u8, name);
 }
 
 pub fn getTop(self: *Window, frame: *Frame) Access {
-    var p = self._frame;
+    var p = self.current()._frame;
     while (p.parent) |parent| {
         p = parent;
     }
@@ -182,14 +204,16 @@ pub fn getTop(self: *Window, frame: *Frame) Access {
 }
 
 fn getParent(self: *Window, frame: *Frame) Access {
-    if (self._frame.parent) |p| {
+    if (self.current()._frame.parent) |p| {
         return Access.init(frame.window, p.window);
     }
     return .{ .window = self };
 }
 
-pub fn getDocument(self: *Window) *Document {
-    return self._document;
+pub fn getDocument(self: *Window, frame: *Frame) !*Document {
+    const target = try self.accessibleCurrent(frame);
+    if (frame._session.independent_popup_pages and frame.page != target._frame.page) target._frame.page.has_external_window_refs = true;
+    return target._document;
 }
 
 pub fn getConsole(self: *Window) *Console {
@@ -352,20 +376,22 @@ fn getFrameElement(self: *const Window) ?*Element.Html.IFrame {
     return self._frame.iframe;
 }
 
-pub fn getLocation(self: *const Window) *Location {
-    return self._location;
+pub fn getLocation(self: *const Window, frame: *Frame) !*Location {
+    const target = try self.accessibleCurrent(frame);
+    if (frame._session.independent_popup_pages and frame.page != target._frame.page) target._frame.page.has_external_window_refs = true;
+    return target._location;
 }
 
 fn setLocation(self: *Window, url: [:0]const u8, frame: *Frame) !void {
-    return frame.scheduleNavigation(url, .{ .reason = .script, .kind = .{ .push = null } }, .{ .script = self._frame });
+    return frame.scheduleNavigation(url, .{ .reason = .script, .kind = .{ .push = null } }, .{ .script = self.current()._frame });
 }
 
-pub fn getHistory(_: *Window, frame: *Frame) *History {
-    return &frame._session.history;
+pub fn getHistory(self: *Window, frame: *Frame) !*History {
+    return if (frame._session.independent_popup_pages) (try self.accessibleCurrent(frame))._frame.page.history else frame.page.history;
 }
 
-fn getNavigation(_: *Window, frame: *Frame) *Navigation {
-    return frame._session.navigation;
+fn getNavigation(self: *Window, frame: *Frame) !*Navigation {
+    return if (frame._session.independent_popup_pages) (try self.accessibleCurrent(frame))._frame.navigation() else frame.navigation();
 }
 
 fn setNavigation(self: *Window, value: js.Value) void {
@@ -743,7 +769,8 @@ pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?
     // `_blank` is reserved and never reuses.
     const is_named = target.len > 0 and !std.ascii.eqlIgnoreCase(target, "_blank");
     if (is_named) {
-        if (page.findPopupByName(target)) |existing| {
+        const existing_popup = if (frame._session.independent_popup_pages) frame._session.findPopupByName(target) else page.findPopupByName(target);
+        if (existing_popup) |existing| {
             if (raw_url.len > 0) {
                 try existing.scheduleNavigation(raw_url, .{
                     .reason = .script,
@@ -771,6 +798,8 @@ pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?
 }
 
 pub fn close(self: *Window) void {
+    const target = self.current();
+    if (target != self) return target.close();
     if (self._closed) {
         return;
     }
@@ -779,6 +808,15 @@ pub fn close(self: *Window) void {
     // maps exactly to membership in page.popups.
     const frame = self._frame;
     const page = frame.page;
+
+    if (page.session.independent_popup_pages and &page.frame == frame) {
+        if (!page.script_opened) return;
+        self._closed = true;
+        // A Runtime.evaluate or timer callback may still be inside this
+        // target's inspector. Tear it down after that JS stack unwinds.
+        page.close_requested = true;
+        return;
+    }
 
     var popup_index: usize = 0;
     while (popup_index < page.popups.items.len) : (popup_index += 1) {
@@ -830,16 +868,27 @@ pub fn focus(_: *Window) void {}
 pub fn blur(_: *Window) void {}
 
 pub fn stop(self: *Window) void {
-    self._frame.stopLoading();
+    self.current()._frame.stopLoading();
 }
 
 pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
-    // For now, we ignore targetOrigin checking and just dispatch the message
-    // In a full implementation, we would validate the origin
-    _ = target_origin;
-
-    const target_frame = self._frame;
+    const target = self.current();
+    if (target._closed) return;
+    const target_frame = target._frame;
     const source_window = target_frame.js.getIncumbent().window;
+    if (frame._session.independent_popup_pages) {
+        const requested_origin = target_origin orelse "/";
+        if (!std.mem.eql(u8, requested_origin, "*")) {
+            if (std.mem.eql(u8, requested_origin, "/")) {
+                if (source_window._frame.js.origin != target_frame.js.origin) return;
+            } else {
+                const requested_url = try frame.call_arena.dupeZ(u8, requested_origin);
+                const expected = (try URL.getOrigin(frame.call_arena, requested_url)) orelse return error.SyntaxError;
+                const actual = target_frame.origin orelse return;
+                if (!std.mem.eql(u8, expected, actual)) return;
+            }
+        }
+    }
 
     const arena = try target_frame.getArena(.medium, "Window.postMessage");
     errdefer arena.release();
@@ -866,6 +915,10 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
         break :blk try c.persist();
     };
     errdefer cloned.release();
+    // MessageEvent.source can outlive the send call and the sender document.
+    if (frame._session.independent_popup_pages and source_window._frame.page != target_frame.page) {
+        source_window._frame.page.has_external_window_refs = true;
+    }
 
     // Origin should be the source window's origin (where the message came from)
     const origin = try source_window._location.getOrigin(&frame.js.execution);
@@ -924,7 +977,7 @@ fn getFrame(self: *Window, idx: usize) !?*Window {
 }
 
 fn getFramesLength(self: *const Window) u32 {
-    return @intCast(self._frame.child_frames.items.len);
+    return @intCast(self.current()._frame.child_frames.items.len);
 }
 
 pub fn getScrollX(self: *const Window) u32 {
@@ -1084,6 +1137,9 @@ pub const Access = union(enum) {
             return .{ .window = accessing };
         }
 
+        if (accessing._frame._session.independent_popup_pages and callee._frame.page != accessing._frame.page) {
+            accessing._frame.page.has_external_window_refs = true;
+        }
         if (callee._frame.js.origin == accessing._frame.js.origin) {
             // two different windows, but same origin, return the full window
             return .{ .window = accessing };
@@ -1275,6 +1331,7 @@ pub const JsApi = struct {
         fn alert(_: *const Window, message: ?[]const u8, frame: *Frame) void {
             var response: Notification.DialogResponse = .{};
             frame._session.notification.dispatch(.javascript_dialog_opening, &.{
+                .frame_id = frame._frame_id,
                 .url = frame.url,
                 .message = message orelse "",
                 .dialog_type = "alert",
@@ -1288,6 +1345,7 @@ pub const JsApi = struct {
         fn confirm(_: *const Window, message: ?[]const u8, frame: *Frame) bool {
             var response: Notification.DialogResponse = .{};
             frame._session.notification.dispatch(.javascript_dialog_opening, &.{
+                .frame_id = frame._frame_id,
                 .url = frame.url,
                 .message = message orelse "",
                 .dialog_type = "confirm",
@@ -1300,6 +1358,7 @@ pub const JsApi = struct {
         fn prompt(_: *const Window, message: ?[]const u8, default_text: ?[]const u8, frame: *Frame) ?[]const u8 {
             var response: Notification.DialogResponse = .{};
             frame._session.notification.dispatch(.javascript_dialog_opening, &.{
+                .frame_id = frame._frame_id,
                 .url = frame.url,
                 .message = message orelse "",
                 .dialog_type = "prompt",

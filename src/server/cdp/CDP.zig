@@ -66,6 +66,8 @@ allocator: Allocator,
 
 // when true, any target creation must be attached.
 target_auto_attach: bool = false,
+target_wait_for_debugger: bool = false,
+target_auto_attach_session: ?[]const u8 = null,
 
 session_id_gen: SessionIdGen = .{},
 browser_session_id_gen: BrowserSessionIdGen = .{},
@@ -77,6 +79,9 @@ browser_context_id_gen: BrowserContextIdGen = .{},
 browser_session_id: ?[]const u8 = null,
 
 browser_context: ?BrowserContext,
+// Target-local protocol state. The first entry also owns the shared browser
+// Session; all subsequent entries share its cookies/storage and Notification.
+targets: std.ArrayList(*BrowserContext) = .empty,
 disable_set_cache_disabled: bool = false,
 
 // Re-used arena for processing a message. Works because we strictly process
@@ -86,9 +91,6 @@ message_arena: std.heap.ArenaAllocator,
 // Retained until the outermost notification handler returns.
 notification_arena: std.heap.ArenaAllocator,
 notification_depth: u32 = 0,
-
-// Valid for 1 frame navigation (what CDP calls a "renderer")
-frame_arena: std.heap.ArenaAllocator,
 
 // Valid for the entire lifetime of the BrowserContext. Should minimize
 // (or altogether eliminate) our use of this.
@@ -110,7 +112,6 @@ pub fn init(self: *CDP, app: *App, socket: posix.socket_t, inbox: *Inbox) !void 
             .browser = undefined,
             .allocator = allocator,
             .browser_context = null,
-            .frame_arena = std.heap.ArenaAllocator.init(allocator),
             .message_arena = std.heap.ArenaAllocator.init(allocator),
             .notification_arena = std.heap.ArenaAllocator.init(allocator),
             .browser_context_arena = std.heap.ArenaAllocator.init(allocator),
@@ -126,11 +127,9 @@ pub fn init(self: *CDP, app: *App, socket: posix.socket_t, inbox: *Inbox) !void 
 }
 
 pub fn deinit(self: *CDP) void {
-    if (self.browser_context) |*bc| {
-        bc.deinit();
-    }
+    self.disposeBrowserContext();
+    self.targets.deinit(self.allocator);
     self.browser.deinit();
-    self.frame_arena.deinit();
     self.message_arena.deinit();
     self.notification_arena.deinit();
     self.browser_context_arena.deinit();
@@ -212,7 +211,10 @@ fn dispatchParsed(self: *CDP, arena: Allocator, sender: Command.Sender, str: []c
         .cdp = self,
         .arena = arena,
         .sender = sender,
-        .browser_context = if (self.browser_context) |*bc| bc else null,
+        .browser_context = if (input.sessionId) |sid|
+            self.targetForSession(sid) orelse (if (self.browser_context) |*bc| bc else null)
+        else
+            (if (self.browser_context) |*bc| bc else null),
     };
 
     // See dispatchStartupCommand for more info on this.
@@ -339,8 +341,8 @@ pub fn resolveSessionId(self: *const CDP, input_session_id: []const u8) ?[]const
             return browser_session_id;
         }
     }
-    const browser_context = if (self.browser_context) |*bc| bc else return null;
-    return browser_context.attached_sessions.getKey(input_session_id);
+    const target = self.targetForSession(input_session_id) orelse return null;
+    return target.attached_sessions.getKey(input_session_id);
 }
 
 fn isValidSessionId(self: *const CDP, input_session_id: []const u8) bool {
@@ -356,16 +358,94 @@ pub fn createBrowserContext(self: *CDP) ![]const u8 {
     self.browser_context = @as(BrowserContext, undefined);
     const browser_context = &self.browser_context.?;
 
-    try BrowserContext.init(browser_context, id, self);
+    BrowserContext.init(browser_context, id, self, null) catch |err| {
+        self.browser_context = null;
+        return err;
+    };
+    self.targets.append(self.allocator, browser_context) catch |err| {
+        browser_context.deinitTarget();
+        self.browser.closeSession();
+        browser_context.notification.deinit();
+        self.browser_context = null;
+        return err;
+    };
     return id;
 }
 
 pub fn disposeBrowserContext(self: *CDP) void {
-    const bc = &(self.browser_context orelse return);
-    bc.deinit();
+    if (self.browser_context == null) return;
+    var reset_proxy = false;
+    var reset_user_agent = false;
+    for (self.targets.items) |target| {
+        reset_proxy = reset_proxy or target.http_proxy_changed;
+        reset_user_agent = reset_user_agent or target.user_agent_changed;
+    }
+    // Keep all targets alive while closing pages: notifications can still
+    // reference their state until every observer has been unregistered.
+    for (self.targets.items) |target| target.notification.unregisterAll(target);
+    for (self.targets.items) |target| target.deinitTarget();
     self.browser.closeSession();
+    if (reset_proxy) self.browser.http_client.changeProxy(null) catch |err| {
+        log.warn(.http, "changeProxy", .{ .err = err });
+    };
+    if (reset_user_agent) self.browser.http_client.clearUserAgentOverride();
+    self.browser.http_client.clearAcceptLanguageOverride();
+    self.browser_context.?.notification.deinit();
+    for (self.targets.items) |target| {
+        if (!target.owns_session) self.allocator.destroy(target);
+    }
+    self.targets.clearRetainingCapacity();
     self.browser_context = null;
     _ = self.browser_context_arena.reset(.{ .retain_with_limit = 1024 * 16 });
+}
+
+pub fn targetForSession(self: *const CDP, session_id: []const u8) ?*BrowserContext {
+    for (self.targets.items) |target| {
+        if (target.attached_sessions.contains(session_id)) return target;
+    }
+    return null;
+}
+
+pub fn targetForId(self: *const CDP, target_id: []const u8) ?*BrowserContext {
+    for (self.targets.items) |target| {
+        if (target.target_id) |*tid| {
+            if (std.mem.eql(u8, tid, target_id)) return target;
+        }
+    }
+    return null;
+}
+
+pub fn targetForFrame(self: *const CDP, frame_id: u32) ?*BrowserContext {
+    for (self.targets.items) |target| {
+        if (target.page_handle) |handle| {
+            if (handle.frame_id == frame_id) return target;
+        }
+    }
+    const root = if (self.browser_context) |*bc| bc else return null;
+    const frame = root.session.findFrameByFrameId(frame_id) orelse return null;
+    const root_id = frame.page.frame._frame_id;
+    for (self.targets.items) |target| {
+        if (target.page_handle) |handle| {
+            if (handle.frame_id == root_id) return target;
+        }
+    }
+    return null;
+}
+
+fn registerPage(self: *CDP, frame: *Frame) !*BrowserContext {
+    if (self.targetForFrame(frame._frame_id)) |target| return target;
+    const root = &self.browser_context.?;
+    // Existing test/embedded clients may attach a primary session before
+    // creating the first page. Bind it rather than inventing another target.
+    // Never reuse a closed target: its preload scripts and protocol state
+    // belong to that page, not to a subsequently created sibling.
+    if (!root.ever_bound) return root;
+    const target = try self.allocator.create(BrowserContext);
+    errdefer self.allocator.destroy(target);
+    try BrowserContext.init(target, root.id, self, root);
+    errdefer target.deinitTarget();
+    try self.targets.append(self.allocator, target);
+    return target;
 }
 
 const SendEventOpts = struct {
@@ -379,6 +459,9 @@ pub fn sendEvent(self: *CDP, method: []const u8, p: anytype, opts: SendEventOpts
     }, .{});
 }
 
+// Historical name retained for the domain APIs. Each instance now owns only
+// one page target's protocol state; session/id/notification are shared by all
+// targets in the actual CDP browser context.
 pub const BrowserContext = struct {
     const Node = @import("Node.zig");
     const AXNode = @import("AXNode.zig");
@@ -441,6 +524,13 @@ pub const BrowserContext = struct {
     };
     id: []const u8,
     cdp: *CDP,
+    owns_session: bool,
+    context_group_id: i32,
+    owned_frame_arena: std.heap.ArenaAllocator,
+    closing: bool = false,
+    announced: bool = false,
+    ever_bound: bool = false,
+    opener_id: ?[14]u8 = null,
 
     // Represents the browser session. There is no equivalent in CDP. For
     // all intents and purpose, from CDP's point of view our Browser and
@@ -460,14 +550,12 @@ pub const BrowserContext = struct {
     // request->response, and thus don't have a cmd and don't have an arena.
     notification_arena: Allocator,
 
-    // Maps to our Page. (There are other types of targets, but we only
-    // deal with "pages" for now). Since we only allow 1 open page at a
-    // time, we only have 1 target_id.
+    // This target maps to one top-level Page in the shared Session.
     target_id: ?[14]u8,
 
     // Navigation-safe handle to this context's page, set when `frameCreated`
-    // fires. A BrowserContext is single-target by protocol, so it resolves its
-    // (live) page/frame through this handle — see `mainFrame` / `mainPage`. The
+    // fires. This target resolves its live page/frame through the handle.
+    // The
     // handle's frame_id is stable across navigations (the replacement reuses
     // it). null until the first page is created.
     page_handle: ?Session.PageHandle = null,
@@ -550,17 +638,21 @@ pub const BrowserContext = struct {
     // WebMCP domain state. Populated when `WebMCP.enable` is received.
     webmcp_invocations: std.AutoHashMapUnmanaged(u32, *@import("domains/webmcp.zig").Invocation) = .empty,
 
-    fn init(self: *BrowserContext, id: []const u8, cdp: *CDP) !void {
+    fn init(self: *BrowserContext, id: []const u8, cdp: *CDP, owner: ?*BrowserContext) !void {
         const allocator = cdp.allocator;
 
         // Create notification for this BrowserContext
-        const notification = try Notification.init(allocator);
-        errdefer notification.deinit();
+        const notification = if (owner) |root| root.notification else try Notification.init(allocator);
+        errdefer if (owner == null) notification.deinit();
 
-        const session = try cdp.browser.newSession(notification);
-        if (cdp.app.config.cookieFile()) |cookie_path| {
-            lp.cookies.loadFromFile(session, cookie_path);
+        const session = if (owner) |root| root.session else try cdp.browser.newSession(notification);
+        errdefer if (owner == null) cdp.browser.closeSession();
+        session.independent_popup_pages = true;
+        if (owner == null) {
+            if (cdp.app.config.cookieFile()) |cookie_path| lp.cookies.loadFromFile(session, cookie_path);
         }
+        const context_group_id = try cdp.browser.env.inspector.?.allocateContextGroup();
+        errdefer cdp.browser.env.inspector.?.releaseContextGroup(context_group_id);
 
         var registry = NodeRegistry.init(allocator);
         errdefer registry.deinit();
@@ -568,6 +660,9 @@ pub const BrowserContext = struct {
         self.* = .{
             .id = id,
             .cdp = cdp,
+            .owns_session = owner == null,
+            .context_group_id = context_group_id,
+            .owned_frame_arena = .init(allocator),
             .target_id = null,
             .session_id = null,
             .session = session,
@@ -577,7 +672,7 @@ pub const BrowserContext = struct {
             .node_registry = registry,
             .node_search_list = undefined,
             .isolated_worlds = .empty,
-            .frame_arena = cdp.frame_arena.allocator(),
+            .frame_arena = undefined,
             .arena = cdp.browser_context_arena.allocator(),
             .notification_arena = cdp.notification_arena.allocator(),
             .intercept_state = try InterceptState.init(allocator),
@@ -585,11 +680,17 @@ pub const BrowserContext = struct {
             .captured_responses = .empty,
             .notification = notification,
         };
+        self.frame_arena = self.owned_frame_arena.allocator();
         self.node_search_list = Node.Search.List.init(allocator, &self.node_registry);
-        errdefer self.deinit();
+        errdefer {
+            notification.unregisterAll(self);
+            self.node_search_list.deinit();
+            self.owned_frame_arena.deinit();
+            self.intercept_state.deinit();
+        }
 
         try notification.register(.frame_remove, self, onFrameRemove);
-        try notification.register(.frame_created, self, onFrameCreated);
+        if (self.owns_session) try notification.register(.frame_created, self, onFrameCreated);
         try notification.register(.frame_navigate, self, onFrameNavigate);
         try notification.register(.frame_navigated, self, onFrameNavigated);
         try notification.register(.frame_navigated_within_document, self, onFrameNavigatedWithinDocument);
@@ -601,14 +702,14 @@ pub const BrowserContext = struct {
         try notification.register(.javascript_dialog_opening, self, onJavascriptDialogOpening);
     }
 
-    pub fn deinit(self: *BrowserContext) void {
+    fn deinitTarget(self: *BrowserContext) void {
         const browser = &self.cdp.browser;
         const env = &browser.env;
 
         // resetContextGroup detach the inspector from all contexts.
         // It appends async tasks, so we make sure we run the message loop
         // before deinit it.
-        env.inspector.?.resetContextGroup();
+        env.inspector.?.resetContextGroupById(self.context_group_id);
         self.detachAllSessions();
 
         // abort all intercepted requests before closing the session/page
@@ -641,8 +742,6 @@ pub const BrowserContext = struct {
         // If the session has a frame, we need to clear it first. The page
         // context is always nested inside of the isolated world context,
         // so we need to shutdown the page one first.
-        browser.closeSession();
-
         self.node_registry.deinit();
         self.node_search_list.deinit();
         self.set_child_nodes_sent.deinit(self.cdp.allocator);
@@ -650,19 +749,9 @@ pub const BrowserContext = struct {
 
         // Session.deinit (called via closeSession above) already cleared this
         // notification off any ownerless CorsGate/RobotsGate transfers.
-        self.notification.deinit();
+        self.owned_frame_arena.deinit();
+        env.inspector.?.releaseContextGroup(self.context_group_id);
 
-        if (self.http_proxy_changed) {
-            // has to be called after browser.closeSession, since it won't
-            // work if there are active connections.
-            browser.http_client.changeProxy(null) catch |err| {
-                log.warn(.http, "changeProxy", .{ .err = err });
-            };
-        }
-        if (self.user_agent_changed) {
-            browser.http_client.clearUserAgentOverride();
-        }
-        browser.http_client.clearAcceptLanguageOverride();
         self.intercept_state.deinit();
     }
 
@@ -865,7 +954,16 @@ pub const BrowserContext = struct {
     // Drivers settle page.close() on detachedFromTarget and drop the target
     // on targetDestroyed, so both are sent even when nothing was attached.
     pub fn closeTarget(self: *BrowserContext) !void {
+        if (self.closing) return;
+        self.closing = true;
+        defer self.closing = false;
+        if (self.page_handle) |handle| handle.close();
+        try self.targetClosed();
+    }
+
+    fn targetClosed(self: *BrowserContext) !void {
         const target_id = self.target_id orelse return;
+        @import("domains/webmcp.zig").cancelAllPending(self);
         const cdp = self.cdp;
         for (self.attached_sessions.values()) |session| {
             self.fetchDisableForSession(session.id);
@@ -882,15 +980,17 @@ pub const BrowserContext = struct {
 
         try cdp.sendEvent("Target.targetDestroyed", .{ .targetId = target_id }, .{});
 
-        if (self.page_handle) |handle| {
-            handle.close();
-            self.page_handle = null;
-        }
+        self.page_handle = null;
         for (self.isolated_worlds.items) |world| {
             world.deinit();
         }
         self.isolated_worlds.clearRetainingCapacity();
+        self.clearCapturedResponses();
+        self.captured_requests = .empty;
+        _ = self.owned_frame_arena.reset(.free_all);
         self.target_id = null;
+        self.announced = false;
+        self.opener_id = null;
     }
 
     pub fn fetchDisableForSession(self: *BrowserContext, session_id: []const u8) void {
@@ -938,11 +1038,13 @@ pub const BrowserContext = struct {
     // Registers for the download notifications dispatched by Frame when a
     // navigation is treated as a file download. Idempotent. See issue #2701.
     pub fn downloadEventsEnable(self: *BrowserContext) !void {
+        if (!self.owns_session) return self.cdp.browser_context.?.downloadEventsEnable();
         try self.notification.register(.download_will_begin, self, onDownloadWillBegin);
         try self.notification.register(.download_progress, self, onDownloadProgress);
     }
 
     pub fn downloadEventsDisable(self: *BrowserContext) void {
+        if (!self.owns_session) return self.cdp.browser_context.?.downloadEventsDisable();
         self.notification.unregister(.download_will_begin, self);
         self.notification.unregister(.download_progress, self);
     }
@@ -969,31 +1071,55 @@ pub const BrowserContext = struct {
 
     fn onModelContextToolAdded(ctx: *anyopaque, event: *const Notification.ModelContextToolEvent) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(event.exec.page.frame._frame_id)) return;
         return @import("domains/webmcp.zig").onToolAdded(self, event);
     }
 
     fn onModelContextToolRemoved(ctx: *anyopaque, event: *const Notification.ModelContextToolEvent) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(event.exec.page.frame._frame_id)) return;
         return @import("domains/webmcp.zig").onToolRemoved(self, event);
     }
 
-    fn onFrameRemove(ctx: *anyopaque, _: Notification.FrameRemove) !void {
+    fn onFrameRemove(ctx: *anyopaque, msg: Notification.FrameRemove) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        const handle = self.page_handle orelse return;
+        if (handle.frame_id != msg.frame_id) return;
         @import("domains/page.zig").frameRemove(self);
+        if (msg.closed and !self.closing) try self.targetClosed();
     }
 
     fn onFrameCreated(ctx: *anyopaque, frame: *Frame) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        return @import("domains/page.zig").frameCreated(self, frame);
+        const target = try self.cdp.registerPage(frame);
+        if (!target.ever_bound) frame.page.waiting_for_debugger = self.cdp.target_auto_attach and self.cdp.target_wait_for_debugger;
+        target.ever_bound = true;
+        try @import("domains/page.zig").frameCreated(target, frame);
+        if (frame.page.opener_frame_id) |opener| {
+            target.opener_id = @import("id.zig").toFrameId(opener);
+        }
+        if (frame.page.script_opened) try @import("domains/target.zig").announceTarget(target);
+    }
+
+    fn ownsFrame(self: *const BrowserContext, frame_id: u32) bool {
+        return self.cdp.targetForFrame(frame_id) == self;
+    }
+
+    fn ownsTransfer(self: *const BrowserContext, transfer: *const HttpClient.Transfer) bool {
+        // Worker transfers use their own frame id; CDP attributes them to
+        // the owning document target, as Network.requestWillBeSent does.
+        return self.ownsFrame(transfer.req.document_frame_id orelse transfer.req.frame_id);
     }
 
     fn onFrameNavigate(ctx: *anyopaque, msg: *const Notification.FrameNavigate) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameNavigate(self, msg);
     }
 
     fn onFrameNavigated(ctx: *anyopaque, msg: *const Notification.FrameNavigated) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
         return @import("domains/page.zig").frameNavigated(arena, self, msg);
@@ -1001,36 +1127,45 @@ pub const BrowserContext = struct {
 
     fn onFrameNavigateFailed(ctx: *anyopaque, msg: *const Notification.FrameNavigateFailed) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameNavigateFailed(self, msg);
     }
 
     fn onFrameNavigatedWithinDocument(ctx: *anyopaque, msg: *const Notification.FrameNavigatedWithinDocument) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameNavigatedWithinDocument(self, msg);
     }
 
     fn onFrameDestroyed(ctx: *anyopaque, frame: *const Frame) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        // The retired Page may already be absent from Session.pages.
+        const handle = self.page_handle orelse return;
+        if (handle.frame_id != frame.page.frame._frame_id) return;
         @import("domains/page.zig").frameDestroyed(self, frame);
     }
 
     fn onFrameChildFrameCreated(ctx: *anyopaque, msg: *const Notification.FrameChildFrameCreated) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.parent_id)) return;
         return @import("domains/page.zig").frameChildFrameCreated(self, msg);
     }
 
     fn onFrameNetworkIdle(ctx: *anyopaque, msg: *const Notification.FrameNetworkIdle) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameNetworkIdle(self, msg);
     }
 
     fn onFrameNetworkAlmostIdle(ctx: *anyopaque, msg: *const Notification.FrameNetworkAlmostIdle) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameNetworkAlmostIdle(self, msg);
     }
 
     fn onHttpRequestStart(ctx: *anyopaque, msg: *const Notification.RequestStart) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
         {
             // capture the request
             const transfer = msg.transfer;
@@ -1050,6 +1185,7 @@ pub const BrowserContext = struct {
 
     fn onHttpRequestIntercept(ctx: *anyopaque, msg: *const Notification.RequestIntercept) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
         try @import("domains/fetch.zig").requestIntercept(arena, self, msg);
@@ -1057,21 +1193,27 @@ pub const BrowserContext = struct {
 
     fn onHttpRequestFail(ctx: *anyopaque, msg: *const Notification.RequestFail) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
         return network_domain.httpRequestFail(self, msg);
     }
 
     fn onFrameDOMContentLoaded(ctx: *anyopaque, msg: *const Notification.FrameDOMContentLoaded) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameDOMContentLoaded(self, msg);
     }
 
     fn onFrameLoaded(ctx: *anyopaque, msg: *const Notification.FrameLoaded) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsFrame(msg.frame_id)) return;
         return @import("domains/page.zig").frameLoaded(self, msg);
     }
 
     fn onJavascriptDialogOpening(ctx: *anyopaque, msg: *const Notification.JavascriptDialogOpening) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (msg.frame_id) |frame_id| {
+            if (!self.ownsFrame(frame_id)) return;
+        } else if (!self.owns_session) return;
         return @import("domains/page.zig").javascriptDialogOpening(self, msg);
     }
 
@@ -1084,6 +1226,7 @@ pub const BrowserContext = struct {
 
     fn onHttpResponseHeadersDone(ctx: *anyopaque, msg: *const Notification.ResponseHeaderDone) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
 
@@ -1122,11 +1265,13 @@ pub const BrowserContext = struct {
 
     fn onHttpRequestDone(ctx: *anyopaque, msg: *const Notification.RequestDone) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
         return network_domain.httpRequestDone(self, msg);
     }
 
     pub fn onHttpResponseData(ctx: *anyopaque, msg: *const Notification.ResponseData) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
 
         const key = keyFromTransfer(msg.transfer);
         const resp = self.captured_responses.getPtr(key) orelse lp.assert(false, "onHttpResponseData missing captured response", .{});
@@ -1148,6 +1293,7 @@ pub const BrowserContext = struct {
 
     fn onHttpRequestAuthRequired(ctx: *anyopaque, data: *const Notification.RequestAuthRequired) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(data.transfer)) return;
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
         try @import("domains/fetch.zig").requestAuthRequired(arena, self, data);
@@ -1155,11 +1301,15 @@ pub const BrowserContext = struct {
 
     fn onHttpRequestServedFromCache(ctx: *anyopaque, msg: *const Notification.RequestServedFromCache) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (!self.ownsTransfer(msg.transfer)) return;
         return network_domain.httpServedFromCache(self, msg);
     }
 
     fn onConsoleMessage(ctx: *anyopaque, msg: *const Notification.ConsoleMessage) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (msg.frame_id) |frame_id| {
+            if (!self.ownsFrame(frame_id)) return;
+        } else if (!self.owns_session) return;
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
         return @import("domains/console.zig").consoleMessage(arena, self, msg);
@@ -1167,6 +1317,9 @@ pub const BrowserContext = struct {
 
     fn onRuntimeConsoleMessage(ctx: *anyopaque, msg: *const Notification.ConsoleMessage) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (msg.frame_id) |frame_id| {
+            if (!self.ownsFrame(frame_id)) return;
+        } else if (!self.owns_session) return;
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
         return @import("domains/runtime.zig").consoleMessage(arena, self, msg);
@@ -1205,7 +1358,7 @@ pub const BrowserContext = struct {
             .bc = self,
             .inspector_session = undefined,
         };
-        attached.inspector_session.init(self.inspector(), attached);
+        attached.inspector_session.initForContextGroup(self.inspector(), attached, self.context_group_id);
         errdefer attached.inspector_session.deinit();
 
         try self.attached_sessions.put(allocator, attached.id, attached);
@@ -1230,6 +1383,10 @@ pub const BrowserContext = struct {
             }
         }
         self.destroySession(kv.value);
+        if (self.attached_sessions.count() == 0) {
+            // No debugger remains to release a newly auto-attached page.
+            if (self.mainPage()) |page| page.waiting_for_debugger = false;
+        }
         return true;
     }
 

@@ -36,6 +36,7 @@ fn dispatchConsoleMessage(values: []js.Value, console_type: Notification.Console
     const ts = lp.datetime.timestamp(.boot);
 
     notification.dispatch(.console_message, &.{
+        .frame_id = exec.page.frame._frame_id,
         .source = .javascript,
         .type = console_type,
         .values = values,
@@ -43,6 +44,7 @@ fn dispatchConsoleMessage(values: []js.Value, console_type: Notification.Console
     });
 
     notification.dispatch(.runtime_console_message, &.{
+        .frame_id = exec.page.frame._frame_id,
         .source = .javascript,
         .type = console_type,
         .values = values,

@@ -99,6 +99,7 @@ fn invokeTool(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame_id = try id.parseFrameId(params.frameId);
     const frame = bc.session.findFrameByFrameId(frame_id) orelse return error.FrameNotFound;
+    if (cmd.cdp.targetForFrame(frame_id) != bc) return error.FrameNotFound;
     const mc = frame.window.getModelContext();
     const tool = mc.findTool(params.toolName) orelse return error.NotFound;
 

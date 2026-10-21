@@ -513,6 +513,7 @@ pub fn runMicrotasks(self: *Env) void {
         var i: usize = 0;
         while (i < self.contexts.items.len) : (i += 1) {
             const ctx = self.contexts.items[i];
+            if (ctx.page.session.independent_popup_pages and ctx.page.destroying) continue;
             const page_scope = ctx.page.logScope();
             v8.v8__MicrotaskQueue__PerformCheckpoint(ctx.microtask_queue, v8_isolate);
             page_scope.exit();
@@ -544,6 +545,7 @@ pub fn runMacrotasks(self: *Env) !void {
     var i: usize = 0;
     while (i < self.contexts.items.len) : (i += 1) {
         const ctx = self.contexts.items[i];
+        if (ctx.page.session.independent_popup_pages and ctx.page.destroying) continue;
         if (comptime lp.IS_TEST == false) {
             // I hate this comptime check as much as you do. But we have tests
             // which rely on short execution before shutdown. In real world, it's
@@ -563,6 +565,7 @@ pub fn runMacrotasks(self: *Env) !void {
 
 pub fn hasMacrotasks(self: *Env) bool {
     for (self.contexts.items) |ctx| {
+        if (ctx.page.session.independent_popup_pages and ctx.page.destroying) continue;
         if (ctx.scheduler.blocksCompletion()) {
             return true;
         }
@@ -573,6 +576,7 @@ pub fn hasMacrotasks(self: *Env) bool {
 pub fn msToNextTask(self: *Env) ?u64 {
     var next_task: u64 = std.math.maxInt(u64);
     for (self.contexts.items) |ctx| {
+        if (ctx.page.session.independent_popup_pages and ctx.page.destroying) continue;
         const candidate = ctx.scheduler.msToNext() orelse continue;
         next_task = @min(candidate, next_task);
     }

@@ -24,7 +24,7 @@ const TaggedOpaque = @import("TaggedOpaque.zig");
 
 const Allocator = std.mem.Allocator;
 
-const CONTEXT_GROUP_ID = 1;
+const DEFAULT_CONTEXT_GROUP_ID = 1;
 const CLIENT_TRUST_LEVEL = 1;
 
 // Inspector exists for the lifetime of the Isolate/Env. 1 Isolate = 1 Inspector.
@@ -37,10 +37,14 @@ const CLIENT_TRUST_LEVEL = 1;
 const Inspector = @This();
 
 unique_id: i64,
+allocator: Allocator,
 isolate: *v8.Isolate,
 handle: *v8.Inspector,
 client: *v8.InspectorClientImpl,
-default_context: ?v8.Global,
+next_context_group_id: i32,
+// These are borrowed Context handles, cleared before their owner releases them.
+// A target's default world must never be selected by another target's session.
+default_contexts: std.AutoHashMapUnmanaged(i32, ?v8.Global),
 
 pub fn init(allocator: Allocator, isolate: *v8.Isolate) !*Inspector {
     const self = try allocator.create(Inspector);
@@ -48,11 +52,15 @@ pub fn init(allocator: Allocator, isolate: *v8.Isolate) !*Inspector {
 
     self.* = .{
         .unique_id = 1,
+        .allocator = allocator,
         .isolate = isolate,
         .client = undefined,
         .handle = undefined,
-        .default_context = null,
+        .next_context_group_id = DEFAULT_CONTEXT_GROUP_ID + 1,
+        .default_contexts = .empty,
     };
+    try self.default_contexts.put(allocator, DEFAULT_CONTEXT_GROUP_ID, null);
+    errdefer self.default_contexts.deinit(allocator);
 
     self.client = v8.v8_inspector__Client__IMPL__CREATE();
     errdefer v8.v8_inspector__Client__IMPL__DELETE(self.client);
@@ -64,14 +72,32 @@ pub fn init(allocator: Allocator, isolate: *v8.Isolate) !*Inspector {
     return self;
 }
 
-pub fn deinit(self: *const Inspector, allocator: Allocator) void {
+pub fn deinit(self: *Inspector, allocator: Allocator) void {
     var hs: v8.HandleScope = undefined;
     v8.v8__HandleScope__CONSTRUCT(&hs, self.isolate);
     defer v8.v8__HandleScope__DESTRUCT(&hs);
 
     v8.v8_inspector__Client__IMPL__DELETE(self.client);
     v8.v8_inspector__Inspector__DELETE(self.handle);
+    self.default_contexts.deinit(allocator);
     allocator.destroy(self);
+}
+
+/// Reserve a fresh group for a CDP target. Group 1 remains available to legacy
+/// single-page callers; ids are not reused while the Inspector is alive.
+pub fn allocateContextGroup(self: *Inspector) !i32 {
+    const id = self.next_context_group_id;
+    const next_id = std.math.add(i32, id, 1) catch return error.ContextGroupIdExhausted;
+    try self.default_contexts.put(self.allocator, id, null);
+    self.next_context_group_id = next_id;
+    return id;
+}
+
+/// Call after detaching this target's inspector sessions. Other targets keep
+/// their execution contexts, remote objects and enabled Runtime domains.
+pub fn releaseContextGroup(self: *Inspector, id: i32) void {
+    self.resetContextGroupById(id);
+    if (id != DEFAULT_CONTEXT_GROUP_ID) _ = self.default_contexts.remove(id);
 }
 
 // From CDP docs
@@ -90,6 +116,21 @@ pub fn contextCreated(
     aux_data: []const u8,
     is_default_context: bool,
 ) void {
+    self.contextCreatedInGroup(DEFAULT_CONTEXT_GROUP_ID, local, name, origin, aux_data, is_default_context);
+}
+
+pub fn contextCreatedInGroup(
+    self: *Inspector,
+    context_group_id: i32,
+    local: *const js.Local,
+    name: []const u8,
+    origin: []const u8,
+    aux_data: []const u8,
+    is_default_context: bool,
+) void {
+    const default_context = self.default_contexts.getPtr(context_group_id) orelse unreachable;
+    if (is_default_context) default_context.* = local.ctx.handle;
+
     v8.v8_inspector__Inspector__ContextCreated(
         self.handle,
         name.ptr,
@@ -98,13 +139,9 @@ pub fn contextCreated(
         origin.len,
         aux_data.ptr,
         aux_data.len,
-        CONTEXT_GROUP_ID,
+        context_group_id,
         local.handle,
     );
-
-    if (is_default_context) {
-        self.default_context = local.ctx.handle;
-    }
 }
 
 pub fn getContextId(_: *const Inspector, local: *const js.Local) i32 {
@@ -112,21 +149,29 @@ pub fn getContextId(_: *const Inspector, local: *const js.Local) i32 {
 }
 
 pub fn contextDestroyed(self: *Inspector, context: *const v8.Context) void {
-    v8.v8_inspector__Inspector__ContextDestroyed(self.handle, context);
-
-    if (self.default_context) |*dc| {
-        if (v8.v8__Global__IsEqual(dc, context)) {
-            self.default_context = null;
+    var defaults = self.default_contexts.valueIterator();
+    while (defaults.next()) |default_context| {
+        if (default_context.*) |*dc| {
+            if (v8.v8__Global__IsEqual(dc, context)) {
+                default_context.* = null;
+            }
         }
     }
+    v8.v8_inspector__Inspector__ContextDestroyed(self.handle, context);
 }
 
-pub fn resetContextGroup(self: *const Inspector) void {
+pub fn resetContextGroup(self: *Inspector) void {
+    self.resetContextGroupById(DEFAULT_CONTEXT_GROUP_ID);
+}
+
+pub fn resetContextGroupById(self: *Inspector, context_group_id: i32) void {
+    const default_context = self.default_contexts.getPtr(context_group_id) orelse return;
+    default_context.* = null;
     var hs: v8.HandleScope = undefined;
     v8.v8__HandleScope__CONSTRUCT(&hs, self.isolate);
     defer v8.v8__HandleScope__DESTRUCT(&hs);
 
-    v8.v8_inspector__Inspector__ResetContextGroup(self.handle, CONTEXT_GROUP_ID);
+    v8.v8_inspector__Inspector__ResetContextGroup(self.handle, context_group_id);
 }
 
 const RemoteObject = struct {
@@ -180,8 +225,8 @@ const RemoteObject = struct {
 // Channel is for v8 -> zig, getting events from the Inspector (that we'll pass
 // back to some opaque context, i.e the CDP AttachedSession).
 // The channel keeps the Session's address, so the owner must not move it
-// between init and deinit. Every Session connects to the same
-// CONTEXT_GROUP_ID and so sees every context.
+// between init and deinit. Sessions attached to one target share its context
+// group; contexts and inspector events from other targets remain isolated.
 // The channel callbacks are defined below, as:
 //   pub export fn v8_inspector__Channel__IMPL__XYZ
 pub const Session = struct {
@@ -195,12 +240,17 @@ pub const Session = struct {
     onResp: *const fn (ctx: *anyopaque, call_id: u32, msg: []const u8) void,
 
     pub fn init(self: *Session, inspector: *Inspector, ctx: anytype) void {
+        self.initForContextGroup(inspector, ctx, DEFAULT_CONTEXT_GROUP_ID);
+    }
+
+    pub fn initForContextGroup(self: *Session, inspector: *Inspector, ctx: anytype, context_group_id: i32) void {
+        std.debug.assert(inspector.default_contexts.contains(context_group_id));
         const Container = @typeInfo(@TypeOf(ctx)).pointer.child;
 
         const channel = v8.v8_inspector__Channel__IMPL__CREATE(inspector.isolate);
         const handle = v8.v8_inspector__Inspector__Connect(
             inspector.handle,
-            CONTEXT_GROUP_ID,
+            context_group_id,
             channel,
             CLIENT_TRUST_LEVEL,
         ).?;
@@ -419,9 +469,10 @@ pub export fn v8_inspector__Client__IMPL__consoleAPIMessage(
 pub export fn v8_inspector__Client__IMPL__ensureDefaultContextInGroup(
     _: *v8.InspectorClientImpl,
     data: *anyopaque,
+    context_group_id: c_int,
 ) callconv(.c) ?*const v8.Context {
     const inspector: *Inspector = @ptrCast(@alignCast(data));
-    const global_handle = inspector.default_context orelse return null;
+    const global_handle = (inspector.default_contexts.get(context_group_id) orelse return null) orelse return null;
     return v8.v8__Global__Get(&global_handle, inspector.isolate);
 }
 
@@ -451,4 +502,107 @@ pub export fn v8_inspector__Channel__IMPL__flushProtocolNotifications(
     _: *anyopaque,
 ) callconv(.c) void {
     // TODO
+}
+
+test "Inspector: target context groups isolate defaults and resets" {
+    const testing = @import("../../testing.zig");
+    const BrowserSession = @import("../Session.zig");
+    const Notification = @import("../../Notification.zig");
+
+    const Recorder = struct {
+        response: [2048]u8 = undefined,
+        response_len: usize = 0,
+        created: usize = 0,
+        cleared: usize = 0,
+
+        pub fn onInspectorResponse(ctx: *anyopaque, _: u32, msg: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(msg.len <= self.response.len);
+            @memcpy(self.response[0..msg.len], msg);
+            self.response_len = msg.len;
+        }
+
+        pub fn onInspectorEvent(ctx: *anyopaque, msg: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.indexOf(u8, msg, "Runtime.executionContextCreated") != null) self.created += 1;
+            if (std.mem.indexOf(u8, msg, "Runtime.executionContextsCleared") != null) self.cleared += 1;
+        }
+
+        fn expectValue(self: *const @This(), id: u32, value: []const u8) !void {
+            try testing.expectJson(.{
+                .id = id,
+                .result = .{ .result = .{ .type = "string", .value = value } },
+            }, self.response[0..self.response_len]);
+        }
+    };
+
+    const env = &testing.test_browser.env;
+    try testing.expectEqual(null, env.inspector);
+    const inspector = try Inspector.init(testing.allocator, env.isolate.handle);
+    env.inspector = inspector;
+    defer {
+        env.inspector = null;
+        inspector.deinit(testing.allocator);
+    }
+
+    const notification = try Notification.init(testing.allocator);
+    defer notification.deinit();
+    var page_session_a: BrowserSession = undefined;
+    try page_session_a.init(&testing.test_browser, notification);
+    defer page_session_a.deinit();
+    var page_session_b: BrowserSession = undefined;
+    try page_session_b.init(&testing.test_browser, notification);
+    defer page_session_b.deinit();
+
+    const group_b = try inspector.allocateContextGroup();
+    defer inspector.releaseContextGroup(group_b);
+    const frame_a = (try page_session_a.createPage()).frame().?;
+    const frame_b = (try page_session_b.createPage()).frame().?;
+    {
+        var ls: js.Local.Scope = undefined;
+        frame_a.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("globalThis.targetName = 'A'", null);
+        inspector.contextCreated(&ls.local, "A", "", "{}", true);
+    }
+    {
+        var ls: js.Local.Scope = undefined;
+        frame_b.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("globalThis.targetName = 'B'", null);
+        inspector.contextCreatedInGroup(group_b, &ls.local, "B", "", "{}", true);
+    }
+
+    var recorder_a: Recorder = .{};
+    var recorder_b: Recorder = .{};
+    var session_a: Session = undefined;
+    session_a.init(inspector, &recorder_a);
+    defer session_a.deinit();
+    var session_b: Session = undefined;
+    session_b.initForContextGroup(inspector, &recorder_b, group_b);
+    defer session_b.deinit();
+
+    session_a.send("{\"id\":1,\"method\":\"Runtime.enable\"}");
+    session_b.send("{\"id\":2,\"method\":\"Runtime.enable\"}");
+    try testing.expectEqual(1, recorder_a.created);
+    try testing.expectEqual(1, recorder_b.created);
+
+    // No executionContextId: V8 must ask for the default of THIS group.
+    session_a.send("{\"id\":3,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"targetName\",\"returnByValue\":true}}");
+    try recorder_a.expectValue(3, "A");
+    session_b.send("{\"id\":4,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"targetName\",\"returnByValue\":true}}");
+    try recorder_b.expectValue(4, "B");
+
+    const b_cleared = recorder_b.cleared;
+    inspector.resetContextGroup();
+    try testing.expectEqual(null, inspector.default_contexts.get(DEFAULT_CONTEXT_GROUP_ID).?);
+    try testing.expectEqual(b_cleared, recorder_b.cleared);
+    session_b.send("{\"id\":5,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"targetName\",\"returnByValue\":true}}");
+    try recorder_b.expectValue(5, "B");
+
+    // Real Context disposal calls contextDestroyed before freeing the borrowed
+    // Global. A later default lookup must return null, not the released handle.
+    page_session_b.closeAllPages();
+    try testing.expectEqual(null, inspector.default_contexts.get(group_b).?);
+    try testing.expectEqual(null, v8_inspector__Client__IMPL__ensureDefaultContextInGroup(inspector.client, inspector, group_b));
 }

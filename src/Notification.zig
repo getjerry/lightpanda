@@ -133,7 +133,10 @@ const Events = union(enum) {
 };
 pub const EventType = std.meta.FieldEnum(Events);
 
-pub const FrameRemove = struct {};
+pub const FrameRemove = struct {
+    frame_id: u32,
+    closed: bool = false,
+};
 
 pub const FrameNavigate = struct {
     req_id: u32,
@@ -267,6 +270,7 @@ pub const RequestServedFromCache = struct {
 };
 
 pub const JavascriptDialogOpening = struct {
+    frame_id: ?u32 = null,
     url: [:0]const u8,
     message: []const u8,
     dialog_type: []const u8,
@@ -349,6 +353,7 @@ pub const ConsoleMessageType = enum {
 };
 
 pub const ConsoleMessage = struct {
+    frame_id: ?u32 = null,
     timestamp: u64,
     source: enum {
         xml,

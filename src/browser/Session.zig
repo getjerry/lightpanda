@@ -32,6 +32,7 @@ const Navigation = @import("webapi/navigation/Navigation.zig");
 
 const Page = @import("Page.zig");
 const Frame = @import("Frame.zig");
+const Window = @import("webapi/Window.zig");
 const Browser = @import("Browser.zig");
 pub const Runner = @import("Runner.zig");
 const Notification = @import("../Notification.zig");
@@ -70,6 +71,13 @@ arena_pool: *ArenaPool,
 // All live top-level Pages. During a root navigation this transiently holds
 // both the live page and its in-flight replacement.
 pages: std.ArrayList(*Page) = .empty,
+
+// CDP opts in; native MCP keeps its existing popup and navigation behavior.
+independent_popup_pages: bool = false,
+origins: std.StringHashMapUnmanaged(*lp.js.Origin) = .empty,
+window_states: std.AutoHashMapUnmanaged(u32, *WindowState) = .empty,
+_retained_pages: std.ArrayList(*Page) = .empty,
+_deinitializing: bool = false,
 
 // Live SharedWorkerGlobalScopes, keyed by "url\x00name", so every
 // `new SharedWorker(url, name)` in the session connects to the same instance.
@@ -132,6 +140,11 @@ download_behavior: DownloadBehavior = .deny,
 download_path: ?[]const u8 = null,
 download_events_enabled: bool = false,
 
+pub const WindowState = struct {
+    navigation: *Navigation,
+    history: History = .{},
+};
+
 pub const DownloadBehavior = enum {
     allow,
     allow_and_name,
@@ -183,11 +196,18 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
 }
 
 pub fn deinit(self: *Session) void {
+    self._deinitializing = true;
     if (self._console_capture) {
         self.notification.unregister(.console_message, self);
     }
 
     self.closeAllPages();
+    for (self._retained_pages.items) |page| {
+        page.deinit();
+        self.browser.page_pool.destroy(page);
+    }
+    self._retained_pages.clearRetainingCapacity();
+    std.debug.assert(self.origins.count() == 0);
 
     // CorsGate/RobotsGate fetches are ownerless, so page/frame teardown above
     // never reaches them.
@@ -291,6 +311,68 @@ pub fn hasPage(self: *const Session) bool {
     return self.pages.items.len != 0;
 }
 
+pub fn windowState(self: *Session, frame_id: u32) !*WindowState {
+    const gop = try self.window_states.getOrPut(self.arena.allocator(), frame_id);
+    if (gop.found_existing) return gop.value_ptr.*;
+    errdefer _ = self.window_states.remove(frame_id);
+    const state = try self.arena.create(WindowState);
+    state.* = .{ .navigation = try Factory.chainedWithAllocator(self.arena.allocator(), .{
+        EventTarget{ ._type = .navigation },
+        Navigation{ ._proto = undefined },
+    }) };
+    gop.value_ptr.* = state;
+    return state;
+}
+
+pub fn findPopupByName(self: *Session, name: []const u8) ?*Frame {
+    for (self.pages.items) |page| {
+        if (page.replaces == null and page.script_opened and std.mem.eql(u8, page.frame.window._name, name)) return &page.frame;
+    }
+    return null;
+}
+
+// Cached cross-page Window references must not point into a freed arena.
+// Retain only exposed documents, inert, until the execution's Session ends.
+fn retainPage(self: *Session, page: *Page) void {
+    deactivateFrame(&page.frame);
+    for (self.browser.env.contexts.items) |ctx| {
+        if (ctx.page == page) {
+            self.idb.detachContext(ctx);
+            self.browser.http_client.abortOwner(ctx.global.httpOwner());
+            ctx.scheduler.reset();
+        }
+    }
+    self._retained_pages.append(self.arena.allocator(), page) catch @panic("OOM");
+}
+
+fn deactivateFrame(frame: *Frame) void {
+    frame.window._closed = true;
+    frame.cancelQueuedNavigation();
+    for (frame.child_frames.items) |child| deactivateFrame(child);
+}
+
+fn updateOpener(frame: *Frame, old: *Window, replacement: ?*Window) void {
+    if (frame.window._opener) |opener| {
+        if (opener._frame.page == old._frame.page) {
+            frame.window._opener = if (opener == old) replacement else null;
+        }
+    }
+    for (frame.child_frames.items) |child| updateOpener(child, old, replacement);
+}
+
+fn replaceOpenerReferences(self: *Session, old: *Window, replacement: ?*Window) void {
+    if (!self.independent_popup_pages) return;
+    for (self.pages.items) |page| updateOpener(&page.frame, old, replacement);
+    for (self._retained_pages.items) |page| updateOpener(&page.frame, old, replacement);
+}
+
+fn copyWindowMetadata(from: *Page, to: *Page) !void {
+    to.opener_frame_id = from.opener_frame_id;
+    to.script_opened = from.script_opened;
+    to.frame.window._opener = from.frame.window._opener;
+    to.frame.window._name = try to.frame_arena.dupe(u8, from.frame.window._name);
+}
+
 // Allocate and initialize a Page.
 fn allocatePage(self: *Session, frame_id: u32) !*Page {
     const browser = self.browser;
@@ -308,6 +390,10 @@ fn queuePageDestruction(self: *Session, page: *Page) void {
         return;
     }
     page.destroying = true;
+    if (!self._deinitializing and self.independent_popup_pages and page.has_external_window_refs) {
+        self.retainPage(page);
+        return;
+    }
     self._page_destruction_queue.append(self.arena.allocator(), page) catch @panic("OOM");
 }
 
@@ -356,10 +442,11 @@ fn removePageFromList(self: *Session, page: *Page) void {
 // NOT a substitute for the careful 5-step sequence in commitPendingPage,
 // which interleaves the OLD-page teardown with the pending-page promotion
 // in a specific order.
-fn tearDownPage(self: *Session, page: *Page) void {
-    self.notification.dispatch(.frame_remove, .{});
+fn tearDownPage(self: *Session, page: *Page, closed: bool) void {
+    self.notification.dispatch(.frame_remove, .{ .frame_id = page.frame._frame_id, .closed = closed });
+    if (closed) self.replaceOpenerReferences(page.frame.window, null);
+    page.navigation.onRemoveFrame();
     self.retire(page);
-    self.navigation.onRemoveFrame();
 }
 
 // Allocate a Page in a free slot, publish it as the active page, and
@@ -371,10 +458,13 @@ fn tearDownPage(self: *Session, page: *Page) void {
 // On any failure after allocation, the errdefers roll back the Page
 // and `active`, leaving the session pageless (the caller is responsible
 // for any prior teardown of an old page).
-fn installNewActivePage(self: *Session, frame_id: u32) !*Frame {
+fn installNewActivePage(self: *Session, frame_id: u32, previous: ?*Page) !*Frame {
     const page = try self.allocatePage(frame_id);
     errdefer self.queuePageDestruction(page);
 
+    if (self.independent_popup_pages) {
+        if (previous) |old| try copyWindowMetadata(old, page);
+    }
     try self.pages.append(self.arena.allocator(), page);
     errdefer _ = self.pages.pop();
 
@@ -394,22 +484,60 @@ pub fn createPage(self: *Session) !PageHandle {
     }
 
     const frame_id = self.nextFrameId();
-    const frame = try self.installNewActivePage(frame_id);
+    const frame = try self.installNewActivePage(frame_id, null);
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html --
     // Creating a new browsing context always produces an initial about:blank
     // Document with its own session history entry, even before any real
     // navigation happens. Without this, navigation.currentEntry crashes on
     // a page that hasn't navigated yet.
-    _ = try self.navigation.pushEntry(
+    _ = try frame.navigation().pushEntry(
         frame.url,
         .{ .source = .navigation, .value = null },
         frame,
         false,
     );
-    self.navigation._initial_entry = true;
+    frame.navigation()._initial_entry = true;
 
     return .{ .session = self, .frame_id = frame_id };
+}
+
+pub fn createPopupPage(self: *Session, opening_frame: *Frame, url: [:0]const u8, name: []const u8, opener: ?*Window) !*Frame {
+    const frame_id = self.nextFrameId();
+    const page = try self.allocatePage(frame_id);
+    errdefer self.queuePageDestruction(page);
+    const frame = &page.frame;
+    page.script_opened = true;
+    page.opener_frame_id = opening_frame.page.frame._frame_id;
+    frame.window._opener = opener;
+    frame.window._name = try page.frame_arena.dupe(u8, if (std.ascii.eqlIgnoreCase(name, "_blank")) "" else name);
+    try self.pages.append(self.arena.allocator(), page);
+    errdefer self.removePageFromList(page);
+    _ = try frame.navigation().pushEntry(frame.url, .{ .source = .navigation, .value = null }, frame, false);
+    frame.navigation()._initial_entry = true;
+    // A new window exposes a same-origin initial about:blank synchronously,
+    // even when CDP auto-attach pauses its eventual network navigation.
+    try frame.navigate("about:blank", .{ .reason = .script, .initiator_origin = opening_frame.origin });
+    if (opener) |creator| {
+        if (creator._frame.origin == null) {
+            // Null origin strings do not identify opaque origins: the initial
+            // blank document must share its creator's actual security token.
+            const origin = creator._frame.js.origin;
+            origin.rc += 1;
+            page.releaseOrigin(frame.js.origin);
+            frame.js.origin = origin;
+            var ls: lp.js.Local.Scope = undefined;
+            frame.js.localScope(&ls);
+            defer ls.deinit();
+            const token = lp.js.v8.v8__Global__Get(&origin.security_token, frame.js.isolate.handle);
+            lp.js.v8.v8__Context__SetSecurityToken(ls.local.handle, token);
+        }
+    }
+    self.notification.dispatch(.frame_created, frame);
+    if (!std.mem.eql(u8, url, "about:blank")) {
+        try page.deferInitialNavigation(url, .{ .reason = .script, .initiator_origin = opening_frame.origin });
+    }
+    return frame;
 }
 
 // Tear down the live page for `frame_id` and any in-flight replacement.
@@ -423,7 +551,7 @@ pub fn closePage(self: *Session, frame_id: u32) void {
     if (self.replacementOf(live)) |pending| {
         self.discardPendingPage(pending);
     }
-    self.tearDownPage(live);
+    self.tearDownPage(live, true);
 }
 
 // Does not dispatch notifications. Used in session.deinit() and used in tests.
@@ -610,6 +738,20 @@ pub fn processQueuedNavigation(self: *Session) !bool {
             i = 0;
         }
 
+        if (page.close_requested) {
+            self._nav_cursor = i;
+            self.closePage(page.frame._frame_id);
+            return true;
+        }
+        if (page.waiting_for_debugger) continue;
+        if (page.deferred_initial_navigation) |navigation| {
+            page.deferred_initial_navigation = null;
+            self._nav_cursor = i;
+            // Init scripts may already have run in the initial blank realm.
+            // A new document needs a new realm, while keeping the target id.
+            try self.initiateRootNavigation(page.frame._frame_id, navigation.url, navigation.opts);
+            return true;
+        }
         if (page.queued_navigation.items.len != 0) {
             // i was already incremented (and wrapped) to the "next" page
             self._nav_cursor = i;
@@ -853,12 +995,10 @@ fn processRootQueuedNavigation(self: *Session, page: *Page) !void {
 // queued-navigation path (processRootQueuedNavigation) and the CDP entry point
 // (initiateRootNavigation); each caller owns any arena tied to `url`/`opts`.
 fn replaceRootImmediate(self: *Session, frame_id: u32, url: [:0]const u8, opts: Frame.NavigateOpts) !void {
-    if (self.livePage(frame_id)) |page| {
-        self.tearDownPage(page);
-    } else if (comptime lp.IS_DEBUG) {
-        lp.assert(false, "Session.replaceRootImmediate - no live page", .{});
-    }
-    const new_frame = try self.installNewActivePage(frame_id);
+    const previous = self.livePage(frame_id) orelse return error.FrameNotFound;
+    self.tearDownPage(previous, false);
+    const new_frame = try self.installNewActivePage(frame_id, previous);
+    self.replaceOpenerReferences(previous.frame.window, new_frame.window);
 
     new_frame.navigate(url, opts) catch |err| {
         log.debug(.browser, "synthetic navigation error", .{ .err = err, .url = url });
@@ -896,6 +1036,7 @@ pub fn initiateRootNavigation(self: *Session, frame_id: u32, url: [:0]const u8, 
     // Reuses `live`'s frame_id: the replacement IS the same browsing context.
     // `replaces` keeps `live` addressable until commit; the `replacement`
     // back-pointer is its inverse
+    if (self.independent_popup_pages) try copyWindowMetadata(live, page);
     page.replaces = live;
     live.replacement = page;
 
@@ -957,8 +1098,8 @@ pub fn commitPendingPage(self: *Session, replacement: *Page) !void {
     // Step 1: clear the OLD page's CDP / V8 inspector state while it is still
     // walkable (node_registry, inspector context group, isolated worlds). OLD
     // is still the live page (index 0); its memory stays alive until step 4.
-    self.notification.dispatch(.frame_remove, .{});
-    self.navigation.onRemoveFrame();
+    self.notification.dispatch(.frame_remove, .{ .frame_id = old.frame._frame_id });
+    old.navigation.onRemoveFrame();
 
     // Step 2: register the new page with CDP. `replacement.replaces` is still
     // set, so the session still reports an in-flight nav and CDP's frameCreated
@@ -973,6 +1114,7 @@ pub fn commitPendingPage(self: *Session, replacement: *Page) !void {
     old.replacement = null;
     replacement.replaces = null;
     self.removePageFromList(old);
+    self.replaceOpenerReferences(old.frame.window, replacement.frame.window);
 
     // Step 4: tear down the OLD page LAST. Anything in steps 1-3 that needed to
     // walk the OLD page's state has already done so. Kill any remaining
@@ -1098,4 +1240,207 @@ test "Session: console capture runs no page JS" {
     try testing.expectEqualSlices(u8, "[log] head [object Object] 10n Symbol(s)\n", session.drainConsoleMessages());
     const probed = try ls.local.exec("globalThis.probed", null);
     try testing.expectEqual(0, try probed.toF64());
+}
+
+test "Session: independent ordinary pages reclaim navigation documents" {
+    var ts: @import("../ToolSession.zig") = undefined;
+    try ts.init(testing.test_app);
+    defer ts.deinit();
+    const session = ts.session;
+    session.independent_popup_pages = true;
+    const handle = try session.createPage();
+    var waiter = session.runner(.{});
+    for (0..4) |_| {
+        try session.initiateRootNavigation(handle.frame_id, "http://127.0.0.1:9582/src/browser/tests/hi.html", .{});
+        try waiter.waitForFrame(handle.frame_id, 2000, .{ .until = .load });
+        try session.initiateRootNavigation(handle.frame_id, "about:blank", .{});
+        session.processDestroyQueues();
+        try testing.expectEqual(1, session.pages.items.len);
+        try testing.expectEqual(0, session._retained_pages.items.len);
+        try testing.expectEqual(1, ts.browser.env.contexts.items.len);
+    }
+    handle.close();
+    session.processDestroyQueues();
+    try testing.expectEqual(0, ts.browser.env.contexts.items.len);
+    try testing.expectEqual(0, session.origins.count());
+}
+
+test "Session: independent popup forwards cached windows across navigation and close" {
+    const check = checkWindowScript;
+    var ts: @import("../ToolSession.zig") = undefined;
+    try ts.init(testing.test_app);
+    defer ts.deinit();
+    const session = ts.session;
+    session.independent_popup_pages = true;
+    const handle = try session.createPage();
+    try handle.navigate("http://127.0.0.1:9582/src/browser/tests/mcp_actions.html", .{});
+    var waiter = session.runner(.{});
+    try waiter.waitForFrame(handle.frame_id, 2000, .{ .until = .load });
+    const opener = handle.frame().?;
+    try check(opener, "document.cookie = 'popupShared=1; path=/'; localStorage.setItem('popupShared', 'yes'); window.child = window.open('mcp_actions.html', 'quote'); child.document.body !== null");
+    const popup_id = session.findPopupByName("quote").?._frame_id;
+    try waiter.waitForFrame(popup_id, 2000, .{ .until = .load });
+    var popup = session.findFrameByFrameId(popup_id).?;
+    try testing.expect(popup.page != opener.page);
+    try testing.expectEqual(handle.frame_id, popup.page.opener_frame_id.?);
+    try testing.expectEqual(opener.js.origin, popup.js.origin);
+    try testing.expect(popup.navigation() != opener.navigation());
+    try check(opener, "!child.closed && child.document.querySelector('#inp') !== null");
+    try check(popup, "document.cookie.includes('popupShared=1') && localStorage.getItem('popupShared') === 'yes' && opener.document.querySelector('#inp') !== null");
+
+    // The original JS window.open result follows B's new document, including
+    // postMessage delivery into B's new context rather than its retired one.
+    try session.initiateRootNavigation(popup_id, "http://127.0.0.1:9582/src/browser/tests/runner/runner1.html", .{});
+    try waiter.waitForFrame(popup_id, 2000, .{ .until = .load });
+    popup = session.findFrameByFrameId(popup_id).?;
+    try check(opener, "!child.closed && child.document.querySelector('#sel1') !== null && child.location.href.endsWith('runner1.html')");
+    try check(popup, "window.savedOpener = opener; onmessage = e => window.received = e.data; history.pushState({quote: 1}, '', '#quote'); true");
+    try check(opener, "child.postMessage('new popup context', '*'); true");
+    try waiter.waitForScript(popup_id, "window.received === 'new popup context'", 1000);
+    const popup_history_length = popup.navigation()._entries.items.len;
+
+    // The reciprocal cached opener forwards as A navigates, without replacing
+    // or closing B or mixing their independent navigation histories.
+    try session.initiateRootNavigation(handle.frame_id, "http://127.0.0.1:9582/src/browser/tests/runner/runner1.html", .{});
+    try waiter.waitForFrame(handle.frame_id, 2000, .{ .until = .load });
+    try testing.expectEqual(popup, session.findFrameByFrameId(popup_id).?);
+    try testing.expectEqual(handle.frame().?.window, popup.window._opener.?);
+    try testing.expectEqual(popup_history_length, popup.navigation()._entries.items.len);
+    try check(popup, "!savedOpener.closed && savedOpener.document.querySelector('#sel1') !== null");
+    try check(handle.frame().?, "onmessage = e => window.received = e.data; true");
+    try check(popup, "savedOpener.postMessage('new opener context', '*'); true");
+    try waiter.waitForScript(handle.frame_id, "window.received === 'new opener context'", 1000);
+    try testing.expectEqual(false, opener.js.scheduler.blocksCompletion());
+
+    handle.close();
+    session.processDestroyQueues();
+    try testing.expectEqual(null, popup.window._opener);
+    try check(popup, "savedOpener.closed && document.querySelector('#sel1') !== null");
+    // Retired realms keep native Window references safe, but run no queued
+    // promises or timers and release fully when the Session ends.
+    try check(popup, "window.retiredRan = false; Promise.resolve().then(() => retiredRan = true); setInterval(() => retiredRan = true, 1); true");
+    popup.window.close();
+    try testing.expectEqual(true, try session.processQueuedNavigation());
+    ts.browser.runMicrotasks();
+    try ts.browser.runMacrotasks();
+    try check(popup, "retiredRan === false");
+    try testing.expectEqual(null, session.findFrameByFrameId(popup_id));
+    try testing.expectEqual(0, session.pages.items.len);
+    try testing.expectEqual(false, popup.js.scheduler.blocksCompletion());
+    try testing.expectEqual(true, popup.window._closed);
+    try ts.restartSession();
+    try testing.expectEqual(0, ts.browser.env.contexts.items.len);
+    try testing.expectEqual(0, ts.session._retained_pages.items.len);
+}
+
+test "Session: paused popup defers its request without blocking other pages" {
+    var ts: @import("../ToolSession.zig") = undefined;
+    try ts.init(testing.test_app);
+    defer ts.deinit();
+    const session = ts.session;
+    session.independent_popup_pages = true;
+    const opener = try session.createPage();
+    try opener.navigate("about:blank", .{});
+
+    var pause_popups = true;
+    try ts.notification.register(.frame_created, &pause_popups, struct {
+        fn created(ctx: *anyopaque, frame: *Frame) !void {
+            const pause: *bool = @ptrCast(@alignCast(ctx));
+            if (frame.page.script_opened) frame.page.waiting_for_debugger = pause.*;
+        }
+    }.created);
+    defer ts.notification.unregister(.frame_created, &pause_popups);
+    const popup = try opener.frame().?.openPopup(.{
+        .url = "http://127.0.0.1:9582/src/browser/tests/mcp_actions.html",
+        .name = "paused",
+        .opener = opener.frame().?.window,
+    });
+    try testing.expect(popup.page.waiting_for_debugger);
+    try testing.expectEqual(opener.frame().?.js.origin, popup.js.origin);
+    try testing.expect(Window.Access.init(opener.frame().?.window, popup.window) == .window);
+    try testing.expect(popup.page.deferred_initial_navigation != null);
+    try testing.expect(popup._load_state == .complete);
+    try testing.expectEqual(false, try session.processQueuedNavigation());
+
+    const other = try session.createPage();
+    try other.navigate("http://127.0.0.1:9582/src/browser/tests/runner/runner1.html", .{});
+    var waiter = session.runner(.{});
+    try waiter.waitForFrame(other.frame_id, 2000, .{ .until = .load });
+    _ = try waiter.waitForSelector(other.frame_id, "#sel1", 10);
+    try testing.expect(popup._load_state == .complete);
+
+    const popup_id = popup._frame_id;
+    pause_popups = false;
+    popup.page.waiting_for_debugger = false;
+    try testing.expectEqual(true, try session.processQueuedNavigation());
+    try waiter.waitForFrame(popup_id, 2000, .{ .until = .load });
+    _ = try waiter.waitForSelector(popup_id, "#inp", 10);
+    try testing.expectEqual(null, session.findFrameByFrameId(popup_id).?.page.deferred_initial_navigation);
+}
+
+fn checkWindowScript(frame: *Frame, source: [:0]const u8) !void {
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const value = try ls.local.exec(source, null);
+    try testing.expect(value.isTrue());
+}
+
+test "Session: independent message source survives navigation and checks current origin" {
+    var ts: @import("../ToolSession.zig") = undefined;
+    try ts.init(testing.test_app);
+    defer ts.deinit();
+    const session = ts.session;
+    session.independent_popup_pages = true;
+    const sender = try session.createPage();
+    try sender.navigate("http://127.0.0.1:9582/src/browser/tests/mcp_actions.html", .{});
+    var waiter = session.runner(.{});
+    try waiter.waitForFrame(sender.frame_id, 2000, .{ .until = .load });
+    const source = sender.frame().?;
+    try checkWindowScript(source, "window.child = window.open('mcp_actions.html', 'receiver'); true");
+    const receiver_id = session.findPopupByName("receiver").?._frame_id;
+    try waiter.waitForFrame(receiver_id, 2000, .{ .until = .load });
+    const receiver = session.findFrameByFrameId(receiver_id).?;
+    try checkWindowScript(receiver, "onmessage = e => window.savedEvent = e; true");
+    try testing.expectEqual(false, source.page.has_external_window_refs);
+    try checkWindowScript(source, "child.postMessage('queued', '*'); true");
+    try testing.expect(source.page.has_external_window_refs);
+    try session.initiateRootNavigation(sender.frame_id, "http://localhost:9582/src/browser/tests/runner/runner1.html", .{});
+    try waiter.waitForFrame(sender.frame_id, 2000, .{ .until = .load });
+    try waiter.waitForScript(receiver_id, "window.savedEvent !== undefined", 1000);
+    try checkWindowScript(receiver,
+        \\window.savedSource = savedEvent.source;
+        \\['document', 'location', 'history', 'navigation'].every(key => {
+        \\  try { savedSource[key]; return false; } catch (e) { return e.name === 'SecurityError'; }
+        \\}) && !savedSource.closed
+    );
+    try checkWindowScript(sender.frame().?, "window.received = ''; onmessage = e => window.received = e.data; true");
+    try checkWindowScript(receiver, "savedSource.postMessage('wrong origin', 'http://127.0.0.1:9582'); true");
+    try ts.browser.runMacrotasks();
+    try checkWindowScript(sender.frame().?, "received === ''");
+    try checkWindowScript(receiver, "savedSource.postMessage('current origin', 'http://localhost:9582'); true");
+    try waiter.waitForScript(sender.frame_id, "received === 'current origin'", 1000);
+    sender.close();
+    session.processDestroyQueues();
+    try checkWindowScript(receiver, "savedSource.closed");
+}
+
+test "Session: independent iframe popup survives removal of its opener document" {
+    var ts: @import("../ToolSession.zig") = undefined;
+    try ts.init(testing.test_app);
+    defer ts.deinit();
+    const session = ts.session;
+    session.independent_popup_pages = true;
+    const handle = try session.createPage();
+    try handle.navigate("http://127.0.0.1:9582/src/browser/tests/runner/iframe_idle.html", .{});
+    var waiter = session.runner(.{});
+    try waiter.waitForFrame(handle.frame_id, 2000, .{ .until = .load });
+    const iframe = handle.frame().?.child_frames.items[1];
+    const popup = try iframe.openPopup(.{ .url = "about:blank", .name = "iframe-popup", .opener = iframe.window });
+    try testing.expectEqual(handle.frame_id, popup.page.opener_frame_id.?);
+    try session.initiateRootNavigation(handle.frame_id, "about:blank", .{});
+    session.processDestroyQueues();
+    try testing.expectEqual(null, popup.window._opener);
+    try testing.expectEqual(popup, session.findFrameByFrameId(popup._frame_id).?);
+    try checkWindowScript(popup, "opener === null && document.body !== null");
 }

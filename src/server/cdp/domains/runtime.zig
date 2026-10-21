@@ -51,7 +51,11 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
-        .runIfWaitingForDebugger => return cmd.sendResult(null, .{}),
+        .runIfWaitingForDebugger => {
+            const target = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+            if (target.mainPage()) |page| page.waiting_for_debugger = false;
+            return cmd.sendResult(null, .{});
+        },
         .enable => return enable(cmd),
         .disable => return disable(cmd),
         // Bookkeeping that can neither observe nor change the page's global.
