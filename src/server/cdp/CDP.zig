@@ -73,10 +73,9 @@ session_id_gen: SessionIdGen = .{},
 browser_session_id_gen: BrowserSessionIdGen = .{},
 browser_context_id_gen: BrowserContextIdGen = .{},
 
-// Session from Target.attachToBrowserTarget. Distinct from the page
-// session (BrowserContext.session_id) as it targets the browser itself and
-// outlives any browser context.
-browser_session_id: ?[]const u8 = null,
+// Each browser attachment has its own identity, independent of page sessions
+// and browser contexts. Playwright and its plugins can attach concurrently.
+browser_sessions: std.StringHashMapUnmanaged(void) = .empty,
 
 browser_context: ?BrowserContext,
 // Target-local protocol state. The first entry also owns the shared browser
@@ -129,6 +128,9 @@ pub fn init(self: *CDP, app: *App, socket: posix.socket_t, inbox: *Inbox) !void 
 pub fn deinit(self: *CDP) void {
     self.disposeBrowserContext();
     self.targets.deinit(self.allocator);
+    var browser_sessions = self.browser_sessions.keyIterator();
+    while (browser_sessions.next()) |session_id| self.allocator.free(session_id.*);
+    self.browser_sessions.deinit(self.allocator);
     self.browser.deinit();
     self.message_arena.deinit();
     self.notification_arena.deinit();
@@ -336,13 +338,55 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
 }
 
 pub fn resolveSessionId(self: *const CDP, input_session_id: []const u8) ?[]const u8 {
-    if (self.browser_session_id) |browser_session_id| {
-        if (std.mem.eql(u8, browser_session_id, input_session_id)) {
-            return browser_session_id;
-        }
-    }
+    if (self.browser_sessions.getKey(input_session_id)) |session_id| return session_id;
     const target = self.targetForSession(input_session_id) orelse return null;
     return target.attached_sessions.getKey(input_session_id);
+}
+
+pub fn attachBrowserSession(self: *CDP) ![]const u8 {
+    const session_id = try self.allocator.dupe(u8, self.browser_session_id_gen.next());
+    errdefer self.allocator.free(session_id);
+    if (self.browser_sessions.contains(session_id)) return error.SessionAlreadyAttached;
+    try self.browser_sessions.put(self.allocator, session_id, {});
+    return session_id;
+}
+
+pub fn detachBrowserSession(self: *CDP, requested_id: []const u8) !bool {
+    const session_id = self.browser_sessions.getKey(requested_id) orelse return false;
+    // Child page sessions share this transport. Detach them before releasing
+    // the parent's id; other browser/page attachments remain usable.
+    for (self.targets.items) |target| {
+        var i: usize = 0;
+        while (i < target.attached_sessions.count()) {
+            const attached = target.attached_sessions.values()[i];
+            if (attached.parent_id) |parent_id| {
+                if (std.mem.eql(u8, parent_id, session_id)) {
+                    target.fetchDisableForSession(attached.id);
+                    try self.sendEvent("Target.detachedFromTarget", .{
+                        .targetId = target.target_id,
+                        .sessionId = attached.id,
+                    }, .{ .session_id = session_id });
+                    _ = target.detachSession(attached.id);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    if (self.target_auto_attach_session) |owner| {
+        if (std.mem.eql(u8, owner, session_id)) {
+            self.target_auto_attach_session = null;
+            self.target_auto_attach = false;
+            self.target_wait_for_debugger = false;
+        }
+    }
+    try self.sendEvent("Target.detachedFromTarget", .{
+        .targetId = "browser",
+        .sessionId = session_id,
+    }, .{});
+    _ = self.browser_sessions.remove(session_id);
+    self.allocator.free(session_id);
+    return true;
 }
 
 fn isValidSessionId(self: *const CDP, input_session_id: []const u8) bool {

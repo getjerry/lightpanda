@@ -969,7 +969,7 @@ test "cdp.Network: cookies" {
         .params = .{ .browserContextId = "BID-S" },
     });
     // Just the untouched test4 should be in the result
-    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{.{ .name = "test4", .value = "value4", .domain = ".example.com", .path = "/mango", .size = 11 }} }, .{ .id = 8 });
+    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{.{ .name = "test4", .value = "value4", .domain = "example.com", .path = "/mango", .size = 11 }} }, .{ .id = 8 });
 
     // Empty after clearBrowserCookies
     try ctx.processMessage(.{

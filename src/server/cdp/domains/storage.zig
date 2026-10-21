@@ -182,7 +182,15 @@ fn buildCdpCookie(allocator: Allocator, param: CdpCookie) !Cookie {
     // Allocate before the struct literal copies `arena` into the result.
     const name = try a.dupe(u8, param.name);
     const value = try a.dupe(u8, param.value);
-    const domain = try Cookie.parseDomain(a, param.url, param.domain);
+    var domain = try Cookie.parseDomain(a, param.url, param.domain);
+    // CDP uses a leading dot to distinguish domain cookies from host-only
+    // cookies. parseDomain handles HTTP's Domain attribute, which also adds
+    // a dot for bare domains; do not widen exported host-only cookies here.
+    if (param.domain) |explicit_domain| {
+        if (explicit_domain.len > 0 and explicit_domain[0] != '.' and domain[0] == '.') {
+            domain = domain[1..];
+        }
+    }
     const path = if (param.path == null) "/" else try Cookie.parsePath(a, null, param.path);
 
     return .{
@@ -328,7 +336,7 @@ test "cdp.Storage: cookies" {
     });
     try ctx.expectSentResult(.{
         .cookies = &[_]ResCookie{
-            .{ .name = "test", .value = "value", .domain = ".example.com", .path = "/mango", .size = 9 },
+            .{ .name = "test", .value = "value", .domain = "example.com", .path = "/mango", .size = 9 },
             .{ .name = "test2", .value = "value2", .domain = "car.example.com", .path = "/", .size = 11, .secure = true }, // No Pancakes!
             .{ .name = "test3", .value = "value3", .domain = "gov.uk", .path = "/", .size = 11 },
         },
@@ -378,4 +386,40 @@ test "cdp.Storage: importing session cookies preserves expiry semantics" {
     try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{
         .{ .name = "session", .value = "value", .domain = "example.com", .httpOnly = true, .secure = true, .expires = -1, .size = 12 },
     } }, .{ .id = 2 });
+}
+
+test "cdp.Storage: cookie import preserves host-only and domain scope" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-COOKIE-SCOPE" });
+    const expires: f64 = @floatFromInt(lp.datetime.timestamp(.real) + 3600);
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Storage.setCookies",
+        .params = .{ .cookies = &[_]CdpCookie{
+            .{ .name = "session", .value = "local", .domain = "localhost", .httpOnly = true, .expires = -1 },
+            .{ .name = "host", .value = "only", .domain = "example.com", .httpOnly = true, .expires = expires },
+            .{ .name = "domain", .value = "shared", .domain = ".example.com", .httpOnly = true },
+        } },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Storage.getCookies" });
+    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{
+        .{ .name = "session", .value = "local", .domain = "localhost", .httpOnly = true, .expires = -1, .size = 12 },
+        .{ .name = "host", .value = "only", .domain = "example.com", .httpOnly = true, .expires = expires, .size = 8 },
+        .{ .name = "domain", .value = "shared", .domain = ".example.com", .httpOnly = true, .size = 12 },
+    } }, .{ .id = 2 });
+
+    const expectRequestCookies = struct {
+        fn check(jar: *CookieJar, url: [:0]const u8, expected: []const u8) !void {
+            var writer: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer writer.deinit();
+            try jar.forRequest(url, &writer.writer, .{ .origin_url = .{ .url = url }, .is_http = true });
+            try testing.expectEqual(expected, writer.written());
+        }
+    }.check;
+    try expectRequestCookies(&bc.session.cookie_jar, "http://localhost/", "session=local");
+    try expectRequestCookies(&bc.session.cookie_jar, "http://child.localhost/", "");
+    try expectRequestCookies(&bc.session.cookie_jar, "http://example.com/", "host=only; domain=shared");
+    try expectRequestCookies(&bc.session.cookie_jar, "http://child.example.com/", "domain=shared");
 }
