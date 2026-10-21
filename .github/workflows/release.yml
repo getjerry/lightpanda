@@ -1,271 +1,169 @@
-name: release build
-
-env:
-  AWS_ACCESS_KEY_ID: ${{ vars.NIGHTLY_BUILD_AWS_ACCESS_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.NIGHTLY_BUILD_AWS_SECRET_ACCESS_KEY }}
-  AWS_BUCKET: ${{ vars.NIGHTLY_BUILD_AWS_BUCKET }}
-  AWS_REGION: ${{ vars.NIGHTLY_BUILD_AWS_REGION }}
-  AWS_CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.AWS_CF_DISTRIBUTION_NIGHTLY }}
-  AWS_CLOUDFRONT_GET_ID: ${{ vars.AWS_CF_GET }}
-
-  RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
-  VERSION_FLAG: ${{ github.ref_type == 'tag' && format('-Dversion={0}', github.ref_name) || '-Dversion=nightly' }}
+name: fork build and release
 
 on:
   push:
+    branches:
+      - 'codex/**'
     tags:
-      - '*'
-  schedule:
-    - cron: "2 2 * * *"
-
-  # Allows you to run this workflow manually from the Actions tab
+      - '*-jerry.*'
   workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: read
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  LIGHTPANDA_DISABLE_TELEMETRY: 'true'
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build-linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-22.04
-            cpu_flag: -Dcpu=x86_64
-          - arch: aarch64
-            # apt.llvm.org no longer publishes an LLVM 23 repo for 22.04
-            # see https://github.com/lightpanda-io/zig-v8-fork/pull/199
-            runner: ubuntu-24.04-arm
-            cpu_flag: -Dcpu=generic
-
-    env:
-      ARCH: ${{ matrix.arch }}
-      OS: linux
-
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
 
+      - name: Set version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_TYPE" == tag ]]; then
+            [[ "$REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+-jerry\.[0-9]+$ ]]
+            release_version="$REF_NAME"
+          else
+            release_version=1.0.0-jerry.dev
+          fi
+          # Explicit build metadata avoids resolveVersion appending a commit count.
+          echo "BINARY_VERSION=$release_version+git.${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+
+      # Reuse the upstream pinned actions and prebuilt static V8 archive.
       - uses: ./.github/actions/install
         with:
-          os: ${{env.OS}}
-          arch: ${{env.ARCH}}
+          os: linux
+          arch: x86_64
 
-      - name: v8 snapshot
+      - name: Check Zig formatting
+        run: zig fmt --check ./
+
+      - name: Run all Zig tests with leak detection
+        env:
+          TEST_FAIL_FIRST: 'true'
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Ddev_fast=false test
+
+      - name: Generate V8 snapshot
         run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
 
-      - name: zig build
-        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dorderfile=orderfile/lightpanda.ld ${{ matrix.cpu_flag }} ${{ env.VERSION_FLAG }}
-
-      - name: Rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: upload on s3
+      - name: Build Linux amd64 release binary
         run: |
-          export DIR=`git show --no-patch --no-notes --pretty='%cs_%h'`
-          aws s3 cp --storage-class=GLACIER_IR lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${DIR}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          aws s3 cp lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${RELEASE}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          aws s3 cp lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/agent-${RELEASE}/lightpanda-agent-${{ env.ARCH }}-${{ env.OS }}
+          zig build -Dsnapshot_path=../../snapshot.bin \
+            -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast \
+            -Dorderfile=orderfile/lightpanda.ld -Dcpu=x86_64 \
+            "-Dversion=$BINARY_VERSION"
+          mkdir -p dist
+          cp zig-out/bin/lightpanda dist/lightpanda-x86_64-linux
+          test "$(dist/lightpanda-x86_64-linux version)" = "$BINARY_VERSION"
 
-      - name: Upload the build
-        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
-        with:
-          allowUpdates: true
-          artifacts: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          tag: ${{ env.RELEASE }}
-          makeLatest: true
+      - name: Check Botly container compatibility
+        run: |
+          docker pull node:22-bookworm
+          docker run --rm --network none --user 1000:1000 \
+            -v "$PWD/dist:/opt/lightpanda:ro" \
+            -e "EXPECTED_VERSION=$BINARY_VERSION" \
+            -e LIGHTPANDA_DISABLE_TELEMETRY=true \
+            --entrypoint sh node:22-bookworm -ec '
+              test "$(/opt/lightpanda/lightpanda-x86_64-linux version)" = "$EXPECTED_VERSION"
+              /opt/lightpanda/lightpanda-x86_64-linux help mcp > /dev/null
+              /opt/lightpanda/lightpanda-x86_64-linux help serve > /dev/null
+            '
 
-      - name: Share binary with packaging jobs
+      - name: Record provenance and checksums
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def output(*args):
+              return subprocess.check_output(args, text=True).strip()
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with open(path, 'rb') as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          binary = Path('dist/lightpanda-x86_64-linux')
+          provenance = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'sourceCommit': os.environ['GITHUB_SHA'],
+              'sourceRef': os.environ['GITHUB_REF'],
+              'upstreamBaseCommit': output('git', 'rev-parse', '1.0.0^{commit}'),
+              'workflowRun': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'binaryVersion': os.environ['BINARY_VERSION'],
+              'platform': 'linux/amd64',
+              'binary': binary.name,
+              'size': binary.stat().st_size,
+              'sha256': sha256(binary),
+              'zigVersion': output('zig', 'version'),
+              'rustVersion': output('rustc', '--version'),
+              'v8ArchiveSha256': sha256('v8/libc_v8.a'),
+              'cargoLockSha256': sha256('src/rust/Cargo.lock'),
+              'containerSmokeImage': json.loads(output('docker', 'image', 'inspect', 'node:22-bookworm', '--format', '{{json .RepoDigests}}')),
+              'validation': ['zig-fmt', 'full-debug-zig-tests', 'node-22-bookworm-version-and-cli-smoke'],
+          }
+          Path('dist/provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
+          PY
+          (cd dist && sha256sum lightpanda-x86_64-linux provenance.json > SHA256SUMS)
+
+      - name: Upload tested build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          path: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          retention-days: 1
+          name: lightpanda-x86_64-linux
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
 
-  build-macos:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # macos-14 runs on arm CPU. see
-          # https://github.com/actions/runner-images?tab=readme-ov-file
-          - arch: aarch64
-            runner: macos-14
-          - arch: x86_64
-            runner: macos-14-large
-
-    env:
-      ARCH: ${{ matrix.arch }}
-      OS: macos
-
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-
-      - uses: ./.github/actions/install
-        with:
-          os: ${{env.OS}}
-          arch: ${{env.ARCH}}
-
-      - name: v8 snapshot
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
-
-      - name: zig build
-        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast ${{ env.VERSION_FLAG }}
-
-      - name: Rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: upload on s3
-        run: |
-          export DIR=`git show --no-patch --no-notes --pretty='%cs_%h'`
-          aws s3 cp --storage-class=GLACIER_IR lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${DIR}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          aws s3 cp lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${RELEASE}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          aws s3 cp lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/agent-${RELEASE}/lightpanda-agent-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: Upload the build
-        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
-        with:
-          allowUpdates: true
-          artifacts: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          tag: ${{ env.RELEASE }}
-          makeLatest: true
-
-  package-debian:
-    if: github.ref_type == 'tag'
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build-linux
-    uses: ./.github/workflows/package-debian.yml
-
-  update-versions:
-    needs: [build-linux, build-macos]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: stable
-
-      - name: Download linux x86_64 binary (to read the version)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: lightpanda-x86_64-linux
+          path: dist
 
-      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: "Generate and publish versions.json"
-        run: |
-          chmod +x lightpanda-x86_64-linux
-          VERSION=$(./lightpanda-x86_64-linux version)
-          aws s3 cp s3://lpd-nightly-build/get/versions.json current.json --content-type application/json
-          docker run --rm -v "$PWD:/work" -w /work \
-            ghcr.io/lightpanda-io/version-fmt:latest \
-            -release "${RELEASE}" -version "${VERSION}" /work/current.json > new.json
-          aws s3 cp new.json s3://lpd-nightly-build/get/versions.json --content-type application/json
-          aws cloudfront create-invalidation --distribution-id ${{ env.AWS_CLOUDFRONT_GET_ID }} --paths "/versions.json"
-
-  invalidate-cloudfront:
-    needs: [build-linux, build-macos]
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
-    steps:
-      - name: cloudfront cache invalidation
-        run: |
-          aws cloudfront create-invalidation --distribution-id ${{ env.AWS_CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
-
-  build-docker-image:
-    needs: build-linux
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate token for browser-docker
-        id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.DISTRIBUTION_APP_ID }}
-          private-key: ${{ secrets.DISTRIBUTION_APP_PRIVATE_KEY }}
-          owner: lightpanda-io
-          repositories: browser-docker
-
-      - name: Trigger docker image build
+      - name: Publish a new experimental release
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-            gh workflow run ci \
-              --repo lightpanda-io/browser-docker \
-              --field tag="${{ env.RELEASE }}"
+          (cd dist && sha256sum --check SHA256SUMS)
+          cat > release-notes.md <<'EOF'
+          Experimental Lightpanda fork for Botly browser compatibility testing.
 
-  update-homebrew-formula:
-    needs: [build-linux, build-macos]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate token for homebrew-browser
-        id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.DISTRIBUTION_APP_ID }}
-          private-key: ${{ secrets.DISTRIBUTION_APP_PRIVATE_KEY }}
-          owner: lightpanda-io
-          repositories: homebrew-browser
+          Assets were built from the tagged source after Zig formatting, all Zig tests (debug/leak detection), and a Node 22 Bookworm container CLI smoke check passed. This does not assert carrier workflow compatibility.
 
-      - name: Trigger homebrew formula update
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-            gh workflow run "Update Formula" \
-              --repo lightpanda-io/homebrew-browser \
-              --field tag="${{ env.RELEASE }}"
-
-  update-python-package:
-    # Version tags only (never nightly): start the wheels build on
-    # lightpanda-python. It bundles this release's binaries, publishes to PyPI
-    # once a maintainer approves the `pypi` environment deployment there, and
-    # then records the matching release on that repo itself — the app token
-    # below can start workflows there but cannot write repository contents.
-    if: github.ref_type == 'tag'
-    needs: [build-linux, build-macos]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Generate token for lightpanda-python
-        id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.DISTRIBUTION_APP_ID }}
-          private-key: ${{ secrets.DISTRIBUTION_APP_PRIVATE_KEY }}
-          owner: lightpanda-io
-          repositories: lightpanda-python
-
-      - name: Start the lightpanda-python wheels build
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PYTHON_REPO: lightpanda-io/lightpanda-python
-        run: |
-          if ! echo "$RELEASE" | grep -qE '^v?[0-9]+(\.[0-9]+)+$'; then
-            echo "tag $RELEASE is not version-shaped; not releasing to PyPI"
-            exit 0
-          fi
-          if gh release view "$RELEASE" --repo "$PYTHON_REPO" >/dev/null 2>&1; then
-            echo "release $RELEASE already exists on $PYTHON_REPO; nothing to do"
-            exit 0
-          fi
-          gh workflow run wheels.yml --repo "$PYTHON_REPO" \
-            --field release="$RELEASE" \
-            --field publish=pypi
-          echo "dispatched; the publish waits for pypi environment approval on $PYTHON_REPO"
+          `provenance.json` records the exact source, binary version, toolchains, V8 archive checksum, and build run. `SHA256SUMS` covers both the Linux amd64 binary and provenance.
+          EOF
+          # create fails if the release exists; never replace a published asset.
+          gh release create "$RELEASE_TAG" \
+            dist/lightpanda-x86_64-linux dist/SHA256SUMS dist/provenance.json \
+            --verify-tag --prerelease --latest=false \
+            --title "Lightpanda $RELEASE_TAG" --notes-file release-notes.md
