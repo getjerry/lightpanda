@@ -257,13 +257,54 @@ const PageWait = struct {
 fn pageWait(self: *const Driver) ?PageWait {
     switch (self.impl) {
         .cdp => |cdp| {
-            const bc = &(cdp.browser_context orelse return null);
-            const page = bc.page_handle orelse return null;
-            return .{ .session = bc.session, .frame_id = page.frame_id };
+            // The first target may be a short-lived storage-state helper.
+            // Its close must not stop timers on the remaining page targets.
+            // Runner pumps every live page in the shared Session.
+            for (cdp.targets.items) |target| {
+                const page = target.page_handle orelse continue;
+                if (page.page() == null) continue;
+                return .{ .session = target.session, .frame_id = page.frame_id };
+            }
+            return null;
         },
         .bidi => |bidi| {
             const context = bidi.browsing_context orelse return null;
             return .{ .session = bidi.user_context.session, .frame_id = context.frame_id };
         },
+    }
+}
+
+test "cdp.driver: closing the first target keeps sibling timers running" {
+    const testing = @import("cdp/testing.zig");
+    const js = @import("../browser/js/js.zig");
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const root = try ctx.loadBrowserContext(.{ .url = "runner/runner1.html" });
+    try root.closeTarget();
+    try testing.expectEqual(null, root.page_handle);
+
+    const first = try root.session.createPage();
+    const second = try root.session.createPage();
+    for ([_]Session.PageHandle{ first, second }) |page| {
+        try page.navigate("http://127.0.0.1:9582/src/browser/tests/runner/runner1.html", .{});
+        try testing.waitForPage(ctx.cdp().targetForFrame(page.frame_id).?);
+    }
+    for ([_]Session.PageHandle{ first, second }) |page| {
+        var scope: js.Local.Scope = undefined;
+        page.frame().?.js.localScope(&scope);
+        defer scope.deinit();
+        try scope.local.eval("window.ticked = false; requestAnimationFrame(() => { window.ticked = true; });", null);
+    }
+
+    // Use the actual server driver: TestContext.expectSent pumps a Runner
+    // itself and would hide a missing driver wait target after the old
+    // one-second runner iteration has expired.
+    try testing.expectEqual(first.frame_id, ctx.driver.pageWait().?.frame_id);
+    try testing.expect(try ctx.driver.tick());
+    for ([_]Session.PageHandle{ first, second }) |page| {
+        var scope: js.Local.Scope = undefined;
+        page.frame().?.js.localScope(&scope);
+        defer scope.deinit();
+        try testing.expect((try scope.local.exec("window.ticked", null)).toBool());
     }
 }
