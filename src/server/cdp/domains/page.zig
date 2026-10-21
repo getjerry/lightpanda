@@ -661,12 +661,15 @@ pub fn frameChildFrameCreated(bc: *CDP.BrowserContext, event: *const Notificatio
 }
 
 pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const Notification.FrameNavigated) !void {
-    // detachTarget could be called, in which case, we still have a frame doing
-    // things, but no session.
-    const session_id = bc.session_id orelse return;
-
     const frame_id = &id.toFrameId(event.frame_id);
     const loader_id = &id.toLoaderId(event.loader_id);
+    const frame = bc.session.findFrameByFrameId(event.frame_id) orelse return error.FrameNotFound;
+    const session_id = bc.session_id orelse {
+        // A detached target still navigates. Register its new document so a
+        // later attach can evaluate in this realm; no Page events are sent.
+        try registerDefaultContext(arena, bc, frame, loader_id);
+        return;
+    };
 
     var cdp = bc.cdp;
 
@@ -734,30 +737,13 @@ pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
     // frame's JS context for inspector.contextCreated prevents re-registering
     // the root context under a new id (which silently invalidates the
     // previous id on the V8 side).
-    const frame = bc.session.findFrameByFrameId(event.frame_id) orelse return error.FrameNotFound;
-
     // frameNavigated event
     try cdp.sendEvent("Page.frameNavigated", .{
         .type = "Navigation",
         .frame = FrameWriter{ .bc = bc, .frame = frame },
     }, .{ .session_id = session_id });
 
-    {
-        const aux_data = try std.fmt.allocPrint(arena, "{{\"isDefault\":true,\"type\":\"default\",\"frameId\":\"{s}\",\"loaderId\":\"{s}\"}}", .{ frame_id, loader_id });
-
-        var ls: js.Local.Scope = undefined;
-        frame.js.localScope(&ls);
-        defer ls.deinit();
-
-        bc.inspector().contextCreatedInGroup(
-            bc.context_group_id,
-            &ls.local,
-            "",
-            frame.origin orelse "",
-            aux_data,
-            is_root_frame,
-        );
-    }
+    try registerDefaultContext(arena, bc, frame, loader_id);
     // A worldName preload script seeds its world into every frame. This is the
     // only way for a world to reach a frame besides the explicit Page.createIsolatedWorld.
     for (bc.scripts_on_new_document.items) |script| {
@@ -825,6 +811,22 @@ pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
     // chromedp client expects to receive the events is this order.
     // see https://github.com/chromedp/chromedp/issues/1558
     try cdp.sendEvent("DOM.documentUpdated", null, .{ .session_id = session_id });
+}
+
+fn registerDefaultContext(arena: Allocator, bc: *CDP.BrowserContext, frame: *Frame, loader_id: []const u8) !void {
+    const aux_data = try std.fmt.allocPrint(arena, "{{\"isDefault\":true,\"type\":\"default\",\"frameId\":\"{s}\",\"loaderId\":\"{s}\"}}", .{ &id.toFrameId(frame._frame_id), loader_id });
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    bc.inspector().contextCreatedInGroup(
+        bc.context_group_id,
+        &ls.local,
+        "",
+        frame.origin orelse "",
+        aux_data,
+        frame == bc.mainFrame(),
+    );
 }
 
 pub fn frameNavigatedWithinDocument(bc: anytype, event: *const Notification.FrameNavigatedWithinDocument) !void {
